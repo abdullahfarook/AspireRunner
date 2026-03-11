@@ -25,6 +25,7 @@
         <PackageLicenseExpression>Unlicense</PackageLicenseExpression>
         <PackageReadmeFile>README.md</PackageReadmeFile>
         <PackageTags>aspire aspire-dashboard opentelemetry otel</PackageTags>
+        <PackageId>DoMin.AspireRunner.AspNetCore</PackageId>
     </PropertyGroup>
 
     <ItemGroup>

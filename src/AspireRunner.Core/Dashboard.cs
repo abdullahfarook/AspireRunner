@@ -148,7 +148,7 @@ public partial class Dashboard : IDashboard
             }
 
             ClearInstanceState();
-            _dashboardProcess = ProcessManagerHelper.Run(DotnetCli.Executable, ["exec", Path.Combine(InstallationPath, DllName)], _environmentVariables, InstallationPath, OnStandardOutput);
+            _dashboardProcess = ProcessManagerHelper.Run(DotnetCli.Executable, ["exec", Path.Combine(InstallationPath, DllName)], _environmentVariables, InstallationPath, OnStandardOutput, name: "Aspire");
             if (_dashboardProcess is null)
             {
                 LogFailedToStartDashboardProcess();
