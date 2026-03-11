@@ -104,6 +104,41 @@ public static class ProcessManagerHelper
 
         return GetProcessOrDefault(pid);  // ← uses own method now
     }
+    public static Process? Attach(
+        int pid,
+        string processName,
+        string[] arguments,
+        IDictionary<string, string?>? environment = null,
+        string? workingDir = null,
+        Action<string>? outputHandler = null,
+        Action<string>? errorHandler = null,
+        bool liveOnly = false,
+        string? name = null)
+    {
+        EnsureManagerRunning();
+
+        var args = string.Join(" ", arguments);
+        var result = Client.TryRegister(
+            processName,
+            args,
+            environment.ToEnvString(),
+            workingDir ?? string.Empty,
+            name,
+            pid: pid).GetAwaiter().GetResult();
+
+        if (result.IsFailure)
+            return null;
+
+        pid = result.Value.ProcessId;
+
+        if (outputHandler is not null)
+            Task.Run(() => Client.StreamStdout(pid, outputHandler, liveOnly: liveOnly));
+
+        if (errorHandler is not null)
+            Task.Run(() => Client.StreamStderr(pid, errorHandler, liveOnly: liveOnly));
+
+        return GetProcessOrDefault(pid);  // ← uses own method now
+    }
 
     // public static bool IsRunning(this Process? process)
     // {
