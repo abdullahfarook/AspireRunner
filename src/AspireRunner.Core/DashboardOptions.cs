@@ -160,7 +160,7 @@ public sealed record RunnerOptions
     /// How the dashboard runs relative to the host application.
     /// </summary>
     [JsonConverter(typeof(JsonStringEnumConverter))]
-    public RunningMode Mode { get; set; } = RunningMode.Embed;
+    public RunningMode Mode { get; set; } = RunningMode.Standalone;
 }
 
 public record McpOptions
