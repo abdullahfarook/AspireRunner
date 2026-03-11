@@ -127,7 +127,7 @@ public partial class Dashboard : IDashboard
                     // Reuse the existing dashboard process instead of restarting
                     _dashboardProcess = instance.Dashboard;
                     LogReusingRunningDashboard(_dashboardProcess.Id);
-                    ProcessManagerHelper.Attach(_dashboardProcess.Id,DotnetCli.Executable, ["exec", Path.Combine(InstallationPath, DllName)], _environmentVariables, InstallationPath, OnStandardOutput, name: "Aspire");
+                    _dashboardProcess = ProcessManagerHelper.Attach(_dashboardProcess,DotnetCli.Executable, ["exec", Path.Combine(InstallationPath, DllName)], _environmentVariables, InstallationPath, OnStandardOutput, name: "Aspire");
                     if (Options.Runner.RestartOnFailure)
                     {
                         RegisterProcessExitHandler();

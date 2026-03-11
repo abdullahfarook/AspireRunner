@@ -105,7 +105,7 @@ public static class ProcessManagerHelper
         return GetProcessOrDefault(pid);  // ← uses own method now
     }
     public static Process? Attach(
-        int pid,
+        Process process,
         string processName,
         string[] arguments,
         IDictionary<string, string?>? environment = null,
@@ -115,6 +115,7 @@ public static class ProcessManagerHelper
         bool liveOnly = false,
         string? name = null)
     {
+        var pid = process.Id;
         EnsureManagerRunning();
 
         var args = string.Join(" ", arguments);
@@ -128,15 +129,14 @@ public static class ProcessManagerHelper
 
         if (result.IsFailure)
             return null;
-
+        var pidChanged = pid != result.Value.ProcessId;
         pid = result.Value.ProcessId;
-
+        if (!pidChanged) return process;
         if (outputHandler is not null)
             Task.Run(() => Client.StreamStdout(pid, outputHandler, liveOnly: liveOnly));
 
         if (errorHandler is not null)
             Task.Run(() => Client.StreamStderr(pid, errorHandler, liveOnly: liveOnly));
-
         return GetProcessOrDefault(pid);  // ← uses own method now
     }
 
