@@ -1,5 +1,4 @@
-﻿using Spectre.Console.Extensions;
-using Spectre.Console.Rendering;
+﻿using Spectre.Console.Rendering;
 
 namespace AspireRunner.Tool;
 
@@ -49,7 +48,11 @@ public partial class Widgets
 
     public static async Task<T> ShowSpinner<T>(this Task<T> task, bool withResult = false)
     {
-        var spinnerInternal = (await task.Spinner(Spinner.Known.Dots, PrimaryColor))!;
+        var spinnerInternal = await AnsiConsole.Status()
+            .Spinner(Spinner.Known.Dots)
+            .SpinnerStyle(new Style(PrimaryColor))
+            .StartAsync("Working...", async _ => await task);
+
         if (withResult)
         {
             AnsiConsole.Write(SuccessCheck());
