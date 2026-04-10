@@ -5,6 +5,8 @@ using System.Globalization;
 using System.Diagnostics;
 using System.Threading;
 using System.Net.NetworkInformation;
+using System.Runtime.InteropServices;
+using System.Text.RegularExpressions;
 
 namespace AspireRunner.Tool.ProcessManager;
 
@@ -159,15 +161,16 @@ public sealed class InMemoryProcessManager
             return false;
         }
 
+        var pid = entry.Process.Pid ?? entry.LastKnownPid;
+        var ports = entry.ExposedPorts;
+
         if (!entry.Process.IsRunning)
         {
+            await EnsurePortsReleasedAsync(ports, pid, cancellationToken).ConfigureAwait(false);
             UpdateProcessState(entry);
             entry.LastUpdatedAt = DateTimeOffset.UtcNow;
             return true;
         }
-
-        var pid = entry.Process.Pid ?? entry.LastKnownPid;
-        var ports = entry.ExposedPorts;
 
         try
         {
@@ -184,7 +187,7 @@ public sealed class InMemoryProcessManager
         }
 
         await WaitForProcessExitAsync(pid, cancellationToken).ConfigureAwait(false);
-        await WaitForPortsReleasedAsync(ports, cancellationToken).ConfigureAwait(false);
+        await EnsurePortsReleasedAsync(ports, pid, cancellationToken).ConfigureAwait(false);
 
         UpdateProcessState(entry);
         entry.LastUpdatedAt = DateTimeOffset.UtcNow;
@@ -240,6 +243,7 @@ public sealed class InMemoryProcessManager
                 if (entry.Process.IsRunning)
                 {
                     var pid = entry.Process.Pid ?? entry.LastKnownPid;
+                    var ports = entry.ExposedPorts;
 
                     try
                     {
@@ -254,6 +258,9 @@ public sealed class InMemoryProcessManager
                     {
                         TryKillByPid(pid);
                     }
+
+                    await WaitForProcessExitAsync(pid, cancellationToken).ConfigureAwait(false);
+                    await EnsurePortsReleasedAsync(ports, pid, cancellationToken).ConfigureAwait(false);
 
                     stoppedCount++;
                 }
@@ -376,14 +383,43 @@ public sealed class InMemoryProcessManager
         }
     }
 
-    private static async Task WaitForPortsReleasedAsync(IReadOnlyList<int> ports, CancellationToken cancellationToken)
+    private static async Task EnsurePortsReleasedAsync(IReadOnlyList<int> ports, int? primaryPid, CancellationToken cancellationToken)
     {
         if (ports.Count == 0)
         {
             return;
         }
 
-        var deadline = DateTimeOffset.UtcNow.AddSeconds(15);
+        if (await WaitForPortsReleasedAsync(ports, TimeSpan.FromSeconds(15), cancellationToken).ConfigureAwait(false))
+        {
+            return;
+        }
+
+        // Some launch flows can leave a detached child process that still owns the bound port.
+        // Force-kill the known process and any current listener owners for managed ports.
+        TryKillByPid(primaryPid);
+
+        foreach (var ownerPid in GetListeningOwnerPidsByPorts(ports))
+        {
+            if (ownerPid == Environment.ProcessId)
+            {
+                continue;
+            }
+
+            TryKillByPid(ownerPid);
+        }
+
+        await WaitForPortsReleasedAsync(ports, TimeSpan.FromSeconds(8), cancellationToken).ConfigureAwait(false);
+    }
+
+    private static async Task<bool> WaitForPortsReleasedAsync(IReadOnlyList<int> ports, TimeSpan timeout, CancellationToken cancellationToken)
+    {
+        if (ports.Count == 0)
+        {
+            return true;
+        }
+
+        var deadline = DateTimeOffset.UtcNow.Add(timeout);
         while (DateTimeOffset.UtcNow < deadline)
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -392,10 +428,106 @@ public sealed class InMemoryProcessManager
             var allReleased = ports.All(port => listeners.All(listener => listener.Port != port));
             if (allReleased)
             {
-                return;
+                return true;
             }
 
             await Task.Delay(250, cancellationToken).ConfigureAwait(false);
+        }
+
+        return false;
+    }
+
+    private static IReadOnlyList<int> GetListeningOwnerPidsByPorts(IReadOnlyList<int> ports)
+    {
+        if (ports.Count == 0 || !RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        {
+            return [];
+        }
+
+        try
+        {
+            using var process = new Process
+            {
+                StartInfo = new ProcessStartInfo
+                {
+                    FileName = "netstat",
+                    Arguments = "-ano -p tcp",
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    UseShellExecute = false,
+                    CreateNoWindow = true
+                }
+            };
+
+            if (!process.Start())
+            {
+                return [];
+            }
+
+            var output = process.StandardOutput.ReadToEnd();
+            process.WaitForExit(3000);
+
+            if (process.ExitCode != 0 || string.IsNullOrWhiteSpace(output))
+            {
+                return [];
+            }
+
+            var expectedPorts = new HashSet<int>(ports);
+            var pids = new HashSet<int>();
+            var lines = output.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries);
+
+            foreach (var rawLine in lines)
+            {
+                var line = rawLine.Trim();
+                if (!line.StartsWith("TCP", StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                var parts = Regex.Split(line, "\\s+");
+                if (parts.Length < 5)
+                {
+                    continue;
+                }
+
+                var localEndpoint = parts[1];
+                var state = parts[3];
+                var pidText = parts[4];
+
+                if (!state.Equals("LISTENING", StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                var separatorIndex = localEndpoint.LastIndexOf(':');
+                if (separatorIndex < 0)
+                {
+                    continue;
+                }
+
+                if (!int.TryParse(localEndpoint[(separatorIndex + 1)..], NumberStyles.Integer, CultureInfo.InvariantCulture, out var localPort))
+                {
+                    continue;
+                }
+
+                if (!expectedPorts.Contains(localPort))
+                {
+                    continue;
+                }
+
+                if (!int.TryParse(pidText, NumberStyles.Integer, CultureInfo.InvariantCulture, out var pid) || pid <= 0)
+                {
+                    continue;
+                }
+
+                pids.Add(pid);
+            }
+
+            return [.. pids];
+        }
+        catch
+        {
+            return [];
         }
     }
 }

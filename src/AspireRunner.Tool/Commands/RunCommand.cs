@@ -934,6 +934,36 @@ public class RunCommand : AsyncCommand<RunCommand.Settings>
             }
         }
 
+        static string ResolveProcessLogColor(string stream, string message)
+        {
+            var text = message.TrimStart();
+
+            if (text.StartsWith("warn", StringComparison.OrdinalIgnoreCase)
+                || text.StartsWith("warning", StringComparison.OrdinalIgnoreCase))
+            {
+                return "yellow";
+            }
+
+            if (text.StartsWith("error", StringComparison.OrdinalIgnoreCase)
+                || text.StartsWith("err", StringComparison.OrdinalIgnoreCase)
+                || text.StartsWith("fail", StringComparison.OrdinalIgnoreCase)
+                || text.StartsWith("fatal", StringComparison.OrdinalIgnoreCase)
+                || text.StartsWith("crit", StringComparison.OrdinalIgnoreCase))
+            {
+                return "red";
+            }
+
+            if (text.StartsWith("info", StringComparison.OrdinalIgnoreCase)
+                || text.StartsWith("information", StringComparison.OrdinalIgnoreCase)
+                || text.StartsWith("debug", StringComparison.OrdinalIgnoreCase)
+                || text.StartsWith("trace", StringComparison.OrdinalIgnoreCase))
+            {
+                return Widgets.PrimaryColorText;
+            }
+
+            return stream.Equals("stderr", StringComparison.OrdinalIgnoreCase) ? "red" : "grey";
+        }
+
         IRenderable BuildProcessPanel()
         {
             return new Panel(new Align(BuildInventoryTable(), HorizontalAlignment.Left, VerticalAlignment.Top))
@@ -955,11 +985,7 @@ public class RunCommand : AsyncCommand<RunCommand.Settings>
                 .TakeLast(visibleLines)
                 .Select(entry =>
                 {
-                    var style = entry.Stream.Equals("stderr", StringComparison.OrdinalIgnoreCase)
-                        ? "red"
-                        : entry.Stream.Equals("stdout", StringComparison.OrdinalIgnoreCase)
-                            ? "grey"
-                            : Widgets.PrimaryColorText;
+                    var style = ResolveProcessLogColor(entry.Stream, entry.Message);
 
                     return (IRenderable)new Markup($"[{style}]{Markup.Escape(entry.Message)}[/]");
                 })
