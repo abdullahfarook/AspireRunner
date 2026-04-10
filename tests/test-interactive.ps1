@@ -1,6 +1,7 @@
 param(
     [switch]$Resume,
     [switch]$KeepHostRunning,
+    [switch]$Auto,
     [int]$DashboardPort = 19088,
     [int]$LpcPort = 38472,
     [int]$NodePort = 39000,
@@ -83,6 +84,8 @@ function Wait-PortState {
 function Wait-HostExit {
     param(
         [int]$HostPid,
+        [string]$ExpectedProcessName,
+        [datetime]$ExpectedStartTimeUtc,
         [int]$TimeoutSeconds = 45
     )
 
@@ -90,6 +93,21 @@ function Wait-HostExit {
     while ((Get-Date) -lt $deadline) {
         $proc = Get-Process -Id $HostPid -ErrorAction SilentlyContinue
         if ($null -eq $proc) {
+            return $true
+        }
+
+        if ($proc.ProcessName -ne $ExpectedProcessName) {
+            return $true
+        }
+
+        try {
+            $currentStartTimeUtc = $proc.StartTime.ToUniversalTime()
+            if ($currentStartTimeUtc -ne $ExpectedStartTimeUtc) {
+                return $true
+            }
+        }
+        catch {
+            # If process metadata cannot be read anymore, treat it as exited/replaced.
             return $true
         }
 
@@ -172,6 +190,72 @@ function Ensure-NodeDependencies {
     }
 
     Assert-True -Condition (Test-Path $expressPath) -Message "Express dependency installed"
+}
+
+function Invoke-ToolCommand {
+    param(
+        [string[]]$Arguments,
+        [string]$Description = "AspireRunner.Tool command"
+    )
+
+    if (Test-Path $toolExe) {
+        $output = & $toolExe @Arguments 2>&1
+    }
+    else {
+        $output = & dotnet $toolDll @Arguments 2>&1
+    }
+
+    if ($LASTEXITCODE -ne 0) {
+        $capturedOutput = [string](@($output) | Out-String)
+        $capturedOutput = $capturedOutput.Trim()
+        throw "$Description failed with exit code $LASTEXITCODE. Args: $($Arguments -join ' ')`n$capturedOutput"
+    }
+
+    return @($output)
+}
+
+function Assert-OutputContains {
+    param(
+        [string[]]$Output,
+        [string]$Regex,
+        [string]$Message
+    )
+
+    $matches = @($Output | Where-Object { $_ -match $Regex })
+    Assert-True -Condition ($matches.Count -gt 0) -Message $Message
+}
+
+function Invoke-ToolProcessAction {
+    param(
+        [string]$Select,
+        [ValidateSet("stop", "restart", "delete", "logs")]
+        [string]$Action,
+        [int]$LogsMaxLines = 0,
+        [int]$LogsTimeoutSeconds = 0
+    )
+
+    $arguments = @(
+        "process",
+        "list",
+        "--lpc",
+        "--lpc-port", $LpcPort,
+        "--select", $Select,
+        "--action", $Action
+    )
+
+    if ($Action -eq "logs") {
+        $arguments += @("--logs-live", "--logs-stdout", "--logs-stderr")
+
+        if ($LogsMaxLines -gt 0) {
+            $arguments += @("--logs-max-lines", $LogsMaxLines)
+        }
+
+        if ($LogsTimeoutSeconds -gt 0) {
+            $arguments += @("--logs-timeout-seconds", $LogsTimeoutSeconds)
+        }
+    }
+
+    return Invoke-ToolCommand -Arguments $arguments -Description "Auto simulated interactive action '$Action' for '$Select'"
 }
 
 function Invoke-LpcRequest {
@@ -304,7 +388,11 @@ function Start-OrAttachHost {
         $existingHost = Get-Process -Id $state.hostPid -ErrorAction SilentlyContinue
         if ($null -ne $existingHost -and (Wait-PortState -Port $LpcPort -ShouldBeListening $true -TimeoutSeconds 3)) {
             Write-Pass -Message "Attached to existing AspireRunner host PID $($state.hostPid)"
-            return [int]$state.hostPid
+            return [pscustomobject]@{
+                Pid = [int]$state.hostPid
+                ProcessName = $existingHost.ProcessName
+                StartTimeUtc = $existingHost.StartTime.ToUniversalTime()
+            }
         }
     }
 
@@ -321,13 +409,18 @@ function Start-OrAttachHost {
         "--multiple"
     )
 
-    $hostProcess = Start-Process -FilePath "dotnet" -ArgumentList $arguments -WorkingDirectory $repoRoot -PassThru -WindowStyle Normal
+    $windowStyle = if ($Auto) { "Hidden" } else { "Normal" }
+    $hostProcess = Start-Process -FilePath "dotnet" -ArgumentList $arguments -WorkingDirectory $repoRoot -PassThru -WindowStyle $windowStyle
     Save-State -HostPid $hostProcess.Id
 
     Assert-True -Condition (Wait-PortState -Port $LpcPort -ShouldBeListening $true -TimeoutSeconds 90) -Message "LPC endpoint is listening on $LpcPort"
     Assert-True -Condition (Wait-PortState -Port $DashboardPort -ShouldBeListening $true -TimeoutSeconds 120) -Message "Aspire dashboard is listening on $DashboardPort"
 
-    return [int]$hostProcess.Id
+    return [pscustomobject]@{
+        Pid = [int]$hostProcess.Id
+        ProcessName = $hostProcess.ProcessName
+        StartTimeUtc = $hostProcess.StartTime.ToUniversalTime()
+    }
 }
 
 function Show-ManualSteps {
@@ -350,8 +443,12 @@ Write-Step "Preparing interactive process-manager harness"
 Ensure-ToolBuild
 Ensure-NodeDependencies
 
-$hostPid = Start-OrAttachHost
+$hostInfo = Start-OrAttachHost
+$hostPid = [int]$hostInfo.Pid
 Write-Pass -Message "Host process is active with PID $hostPid"
+if ($Auto) {
+    Write-Pass -Message "Auto simulation mode is enabled"
+}
 
 $nodeScriptPath = Join-Path $testsDir "app.js"
 $csharpProjectPath = Join-Path $testsDir "app.csproj"
@@ -373,65 +470,128 @@ Write-Host "Session endpoints:" -ForegroundColor Yellow
     StateFile = $statePath
 } | Format-List
 
-Show-ManualSteps -Title "Interactive exit (detach back to dashboard view)" -Steps @(
-    "Focus the Aspire host terminal window.",
-    "Press P to open the process actions view.",
-    "Exit the process actions view and return to the main dashboard view."
-)
+if ($Auto) {
+    Write-Step "Interactive exit (detach back to dashboard view) - auto simulation"
+    $listOutput = Invoke-ToolCommand -Arguments @(
+        "process",
+        "list",
+        "--lpc",
+        "--lpc-port", $LpcPort,
+        "--running-only"
+    ) -Description "Auto simulated process actions open/close"
+
+    Assert-OutputContains -Output $listOutput -Regex "Process inventory source" -Message "Process list output includes inventory source header"
+    Assert-OutputContains -Output $listOutput -Regex "Attached host inventory" -Message "Process list output confirms LPC-attached inventory source"
+
+    $nodeListed = Get-ProcessByName -Name "NodeExpressTestApp"
+    $csharpListed = Get-ProcessByName -Name "CSharpSingleFileTestApp"
+    Assert-True -Condition ($null -ne $nodeListed) -Message "LPC list contains Node app"
+    Assert-True -Condition ($null -ne $csharpListed) -Message "LPC list contains C# app"
+}
+else {
+    Show-ManualSteps -Title "Interactive exit (detach back to dashboard view)" -Steps @(
+        "Focus the Aspire host terminal window.",
+        "Press P to open the process actions view.",
+        "Exit the process actions view and return to the main dashboard view."
+    )
+}
 
 Assert-True -Condition (Wait-PortState -Port $LpcPort -ShouldBeListening $true -TimeoutSeconds 10) -Message "LPC endpoint stays active after returning from process actions"
 Assert-True -Condition (Wait-PortState -Port $DashboardPort -ShouldBeListening $true -TimeoutSeconds 10) -Message "Dashboard stays active after returning from process actions"
 
-Show-ManualSteps -Title "Interactive viewLogs on selected process" -Steps @(
-    "Press P to open process actions.",
-    "Select NodeExpressTestApp.",
-    "Choose Logs and verify both stdout and stderr lines appear.",
-    "Exit logs and return to the main dashboard view."
-)
+if ($Auto) {
+    Write-Step "Interactive viewLogs on selected process - auto simulation"
+    $logsOutput = Invoke-ToolProcessAction -Select "NodeExpressTestApp" -Action "logs" -LogsMaxLines 8 -LogsTimeoutSeconds 12
+    Assert-OutputContains -Output $logsOutput -Regex "\[stdout\]" -Message "Logs output includes stdout lines"
+    Assert-OutputContains -Output $logsOutput -Regex "\[stderr\]" -Message "Logs output includes stderr lines"
+}
+else {
+    Show-ManualSteps -Title "Interactive viewLogs on selected process" -Steps @(
+        "Press P to open process actions.",
+        "Select NodeExpressTestApp.",
+        "Choose Logs and verify both stdout and stderr lines appear.",
+        "Exit logs and return to the main dashboard view."
+    )
 
-Assert-True -Condition (Ask-YesNo -Prompt "Did logs show both stdout and stderr lines") -Message "Interactive logs check confirmed"
+    Assert-True -Condition (Ask-YesNo -Prompt "Did logs show both stdout and stderr lines") -Message "Interactive logs check confirmed"
+}
 
-Show-ManualSteps -Title "Interactive selected-process stop (Node)" -Steps @(
-    "Press P.",
-    "Select NodeExpressTestApp.",
-    "Choose Stop."
-)
+if ($Auto) {
+    Write-Step "Interactive selected-process stop (Node) - auto simulation"
+    $stopNodeOutput = Invoke-ToolProcessAction -Select "NodeExpressTestApp" -Action "stop"
+    Assert-OutputContains -Output $stopNodeOutput -Regex "Stopped process" -Message "Stop action output confirms node process was stopped"
+}
+else {
+    Show-ManualSteps -Title "Interactive selected-process stop (Node)" -Steps @(
+        "Press P.",
+        "Select NodeExpressTestApp.",
+        "Choose Stop."
+    )
+}
 
 Assert-True -Condition (Wait-PortState -Port $NodePort -ShouldBeListening $false -TimeoutSeconds 35) -Message "Node app port $NodePort is released after interactive stop"
 $nodeAfterStop = Get-ProcessByName -Name "NodeExpressTestApp"
 Assert-True -Condition ($null -ne $nodeAfterStop -and -not $nodeAfterStop.running) -Message "Node process is registered and marked stopped"
 
-Show-ManualSteps -Title "Interactive selected-process restart (Node)" -Steps @(
-    "Press P.",
-    "Select NodeExpressTestApp.",
-    "Choose Restart."
-)
+if ($Auto) {
+    Write-Step "Interactive selected-process restart (Node) - auto simulation"
+    $restartNodeOutput = Invoke-ToolProcessAction -Select "NodeExpressTestApp" -Action "restart"
+    Assert-OutputContains -Output $restartNodeOutput -Regex "Restarted process" -Message "Restart action output confirms node process restart"
+}
+else {
+    Show-ManualSteps -Title "Interactive selected-process restart (Node)" -Steps @(
+        "Press P.",
+        "Select NodeExpressTestApp.",
+        "Choose Restart."
+    )
+}
 
 Assert-True -Condition (Wait-PortState -Port $NodePort -ShouldBeListening $true -TimeoutSeconds 45) -Message "Node app port $NodePort is listening after interactive restart"
 $nodeAfterRestart = Get-ProcessByName -Name "NodeExpressTestApp"
 Assert-True -Condition ($null -ne $nodeAfterRestart -and $nodeAfterRestart.running) -Message "Node process is running after interactive restart"
 
-Show-ManualSteps -Title "Interactive selected-process stop (CSharp)" -Steps @(
-    "Press P.",
-    "Select CSharpSingleFileTestApp.",
-    "Choose Stop."
-)
+if ($Auto) {
+    Write-Step "Interactive selected-process stop (CSharp) - auto simulation"
+    $stopCSharpOutput = Invoke-ToolProcessAction -Select "CSharpSingleFileTestApp" -Action "stop"
+    Assert-OutputContains -Output $stopCSharpOutput -Regex "Stopped process" -Message "Stop action output confirms C# process was stopped"
+}
+else {
+    Show-ManualSteps -Title "Interactive selected-process stop (CSharp)" -Steps @(
+        "Press P.",
+        "Select CSharpSingleFileTestApp.",
+        "Choose Stop."
+    )
+}
 
 Assert-True -Condition (Wait-PortState -Port $CSharpPort -ShouldBeListening $false -TimeoutSeconds 35) -Message "C# app port $CSharpPort is released after interactive stop"
 
-Show-ManualSteps -Title "Interactive selected-process restart (CSharp)" -Steps @(
-    "Press P.",
-    "Select CSharpSingleFileTestApp.",
-    "Choose Restart."
-)
+if ($Auto) {
+    Write-Step "Interactive selected-process restart (CSharp) - auto simulation"
+    $restartCSharpOutput = Invoke-ToolProcessAction -Select "CSharpSingleFileTestApp" -Action "restart"
+    Assert-OutputContains -Output $restartCSharpOutput -Regex "Restarted process" -Message "Restart action output confirms C# process restart"
+}
+else {
+    Show-ManualSteps -Title "Interactive selected-process restart (CSharp)" -Steps @(
+        "Press P.",
+        "Select CSharpSingleFileTestApp.",
+        "Choose Restart."
+    )
+}
 
 Assert-True -Condition (Wait-PortState -Port $CSharpPort -ShouldBeListening $true -TimeoutSeconds 45) -Message "C# app port $CSharpPort is listening after interactive restart"
 
-Show-ManualSteps -Title "Interactive selected-process delete (CSharp)" -Steps @(
-    "Press P.",
-    "Select CSharpSingleFileTestApp.",
-    "Choose Delete."
-)
+if ($Auto) {
+    Write-Step "Interactive selected-process delete (CSharp) - auto simulation"
+    $deleteCSharpOutput = Invoke-ToolProcessAction -Select "CSharpSingleFileTestApp" -Action "delete"
+    Assert-OutputContains -Output $deleteCSharpOutput -Regex "Deleted process" -Message "Delete action output confirms C# process removal"
+}
+else {
+    Show-ManualSteps -Title "Interactive selected-process delete (CSharp)" -Steps @(
+        "Press P.",
+        "Select CSharpSingleFileTestApp.",
+        "Choose Delete."
+    )
+}
 
 Assert-True -Condition (Wait-PortState -Port $CSharpPort -ShouldBeListening $false -TimeoutSeconds 35) -Message "C# app port $CSharpPort is released after interactive delete"
 $csharpAfterDelete = Get-ProcessByName -Name "CSharpSingleFileTestApp"
@@ -444,12 +604,19 @@ if ($KeepHostRunning) {
     exit 0
 }
 
-Show-ManualSteps -Title "Interactive stop host" -Steps @(
-    "Focus the Aspire host terminal window.",
-    "Press Esc to exit the host runner."
-)
+if ($Auto) {
+    Write-Step "Interactive stop host - auto simulation via LPC shutdown"
+    $shutdownResponse = Invoke-LpcRequest -Request @{ command = "Shutdown" }
+    Assert-True -Condition $shutdownResponse.ok -Message "Host shutdown command acknowledged in auto simulation"
+}
+else {
+    Show-ManualSteps -Title "Interactive stop host" -Steps @(
+        "Focus the Aspire host terminal window.",
+        "Press Esc to exit the host runner."
+    )
+}
 
-Assert-True -Condition (Wait-HostExit -HostPid $hostPid -TimeoutSeconds 50) -Message "Host process exited after interactive stop"
+Assert-True -Condition (Wait-HostExit -HostPid $hostPid -ExpectedProcessName $hostInfo.ProcessName -ExpectedStartTimeUtc $hostInfo.StartTimeUtc -TimeoutSeconds 50) -Message "Host process exited after interactive stop"
 Assert-True -Condition (Wait-PortState -Port $DashboardPort -ShouldBeListening $false -TimeoutSeconds 45) -Message "Dashboard port $DashboardPort released"
 Assert-True -Condition (Wait-PortState -Port $LpcPort -ShouldBeListening $false -TimeoutSeconds 45) -Message "LPC port $LpcPort released"
 Assert-True -Condition (Wait-PortState -Port $NodePort -ShouldBeListening $false -TimeoutSeconds 45) -Message "Node app port $NodePort released"
