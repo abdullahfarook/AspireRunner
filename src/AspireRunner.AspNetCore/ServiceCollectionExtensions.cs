@@ -9,7 +9,10 @@ public static class ServiceCollectionExtensions
         services.AddOptions<DashboardOptions>()
             .Configure(options => configureOptions?.Invoke(options));
 
-        services.AddSingleton<IDashboardFactory, DashboardFactory>();
+        services.AddSingleton<IProcessFactory, ProcessFactory>();
+#pragma warning disable CS0618
+        services.AddSingleton<IDashboardFactory>(sp => (IDashboardFactory)sp.GetRequiredService<IProcessFactory>());
+#pragma warning restore CS0618
         services.AddHostedService<AspireRunnerService>();
 
         return services;

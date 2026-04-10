@@ -2,7 +2,7 @@
 
 namespace AspireRunner.Core;
 
-public partial class DashboardFactory
+public partial class ProcessFactory
 {
     [LoggerMessage(
         Level = LogLevel.Trace,

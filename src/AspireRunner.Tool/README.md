@@ -30,10 +30,21 @@ above.
 > By default, The runner will download the dashboard to the user's `.dotnet` directory (`~/.dotnet/.AspireRunner`),
 > this can be changed by setting the `ASPIRE_RUNNER_PATH` environment variable.
 
+Available root command groups:
+- `aspire` for Aspire Dashboard-specific operations
+- `process` for generic executable process management
+
+> [!IMPORTANT]
+> The process manager inventory is currently in-memory and session-scoped.
+> Entries are available while the current runner process is alive.
+>
+> A local process-control (LPC) TCP endpoint is exposed while long-running runner commands are active.
+> Default endpoint: `127.0.0.1:38472` (compatible with ProcessManager.Client request/response payloads).
+
 ### Run command
 
 ```bash
-aspire-dashboard [run] [ARGUMENTS] [OPTIONS]
+aspire-dashboard aspire [run] [ARGUMENTS] [OPTIONS]
 
 ARGUMENTS:
     [version]    The version of the dashboard to run
@@ -66,7 +77,7 @@ OPTIONS:
 ### Install command
 
 ```bash
-aspire-dashboard install [version] [OPTIONS]
+aspire-dashboard aspire install [version] [OPTIONS]
 
 ARGUMENTS:
     [version]    The version of the dashboard to install, pass 'latest' to install the latest version available
@@ -79,7 +90,7 @@ OPTIONS:
 ### Uninstall command
 
 ```bash
-aspire-dashboard uninstall [version] [OPTIONS]
+aspire-dashboard aspire uninstall [version] [OPTIONS]
 
 ARGUMENTS:
     [version]    The version of the dashboard to uninstall, pass 'all' or '*' to uninstall all versions
@@ -93,5 +104,87 @@ OPTIONS:
 Removes old versions of the dashboard and other temporary files
 
 ```bash
-aspire-dashboard cleanup
+aspire-dashboard aspire cleanup
 ```
+
+### Process run command
+
+Runs and manages any executable process without Aspire-specific assumptions.
+
+```bash
+aspire-dashboard process run <exe> [OPTIONS]
+
+OPTIONS:
+                               DEFAULT
+    -h, --help                            Prints help information
+        --args                            Arguments string passed to the executable (use --args="..." when values start with '-')
+        --name                            Display name for the managed process
+    --id                              Process id in the session inventory
+        --working-dir                     Working directory for the process
+        --env                             Environment variable in KEY=VALUE format. Pass multiple times to add more entries
+        --detach                          Start the process and return immediately
+        --restart-on-failure              Automatically restart the process when it exits unexpectedly
+        --restart-delay        2          Delay in seconds before restarting after an unexpected exit
+        --pipe-output          True       Write process output directly to the terminal
+```
+
+### Process list command
+
+Lists managed processes in the current runner session inventory.
+If the local session inventory is empty, the command automatically attempts to attach to the active LPC host endpoint and renders that host inventory.
+
+```bash
+aspire-dashboard process list [--running-only] [--auto-attach] [--lpc] [--lpc-port <port>]
+```
+
+- `--auto-attach` (default: true): if local inventory is empty, query LPC host list automatically
+- `--lpc`: always query the LPC host list directly
+- `--lpc-port`: override LPC port (default: `38472`)
+
+### Process stop command
+
+Stops a managed process by id.
+
+```bash
+aspire-dashboard process stop <id>
+```
+
+### Process restart command
+
+Restarts a managed process by id.
+
+```bash
+aspire-dashboard process restart <id>
+```
+
+### Process remove command
+
+Removes a managed process from inventory (and stops it unless `--keep-running` is passed).
+
+```bash
+aspire-dashboard process remove <id> [--keep-running]
+```
+
+### Run UI process inventory
+
+The `aspire-dashboard aspire run` terminal UI now includes a process inventory table fed by the in-memory manager. This is the first step toward replacing fixed Aspire-only status rows with profile-based managed process inventory rows.
+
+### ProcessManager.Client compatibility (LPC)
+
+While `aspire-dashboard aspire run ...` or non-detached `aspire-dashboard process run ...` is active, a local TCP LPC server is started on `127.0.0.1:38472`.
+
+Compatible request commands:
+- `List`
+- `IsAlreadyExist`
+- `Register`
+- `Stop`
+- `Restart`
+- `Remove` / `Delete`
+- `Shutdown`
+- `Stdout` / `StdoutLiveOnly`
+- `Stderr` / `StderrLiveOnly`
+
+`Shutdown` stops all managed processes tracked by the active runner host and then exits the host process.
+
+Current limitations:
+- Detached `process run --detach` exits quickly, so the in-process LPC endpoint does not stay alive after command completion.

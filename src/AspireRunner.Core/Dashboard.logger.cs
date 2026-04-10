@@ -72,6 +72,19 @@ public partial class Dashboard
 
     private void OnStandardOutput(string line)
     {
+        CaptureStdoutLine(line);
+
+        if (_runtimeProfile is RuntimeProfile.ExecutableProcess)
+        {
+            var trimmed = line.Trim();
+            if (!string.IsNullOrEmpty(trimmed) && _logger.IsEnabled(LogLevel.Information) && Options.Runner.PipeOutput)
+            {
+                _logger.LogInformation("[{DisplayName}] {Line}", DisplayName, trimmed);
+            }
+
+            return;
+        }
+
         _lastOutput ??= new StringBuilder();
 
         var trimmedLine = line.Trim();
@@ -137,6 +150,23 @@ public partial class Dashboard
         HandleDashboardOutput(output);
         _lastOutput.Clear();
         _lastOutputLevel = null;
+    }
+
+    private void OnStandardError(string line)
+    {
+        CaptureStderrLine(line);
+
+        var trimmed = line.Trim();
+        if (string.IsNullOrEmpty(trimmed))
+        {
+            return;
+        }
+
+        HasErrors = true;
+        if (_logger.IsEnabled(LogLevel.Warning) && Options.Runner.PipeOutput)
+        {
+            _logger.LogWarning("[{DisplayName}] {Line}", DisplayName, trimmed);
+        }
     }
 
     private static bool IsStackTrace(string line) =>

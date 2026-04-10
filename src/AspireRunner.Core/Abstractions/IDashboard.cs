@@ -1,7 +1,9 @@
 ﻿namespace AspireRunner.Core.Abstractions;
 
-public interface IDashboard
+public interface IDashboard : IManagedProcess
 {
+    string IManagedProcess.DisplayName => "Aspire Dashboard";
+
     Version Version { get; }
 
     DashboardOptions Options { get; }
@@ -10,13 +12,11 @@ public interface IDashboard
 
     bool HasErrors { get; }
 
-    bool IsRunning { get; }
-
-    int? Pid { get; }
-
     string? Url { get; }
 
     IReadOnlyList<(string Url, string Protocol)>? OtlpEndpoints { get; }
+
+    string? McpEndpoint { get; }
 
     /// <summary>
     /// Triggered when the Aspire Dashboard has started and the UI is ready.
@@ -37,19 +37,4 @@ public interface IDashboard
     /// </summary>
     event Action<string>? McpEndpointReady;
 
-    /// <summary>
-    /// Starts the Aspire Dashboard process.
-    /// </summary>
-    Task StartAsync(CancellationToken cancellationToken = default);
-
-    /// <summary>
-    /// Stops the Aspire Dashboard process.
-    /// </summary>
-    Task StopAsync(CancellationToken cancellationToken = default);
-
-    /// <summary>
-    /// Returns a task that completes when the Aspire Dashboard process exits or when the cancellation token is triggered.
-    /// </summary>
-    /// <param name="cancellationToken">The cancellation token to monitor for cancellation requests.</param>
-    Task WaitForExitAsync(CancellationToken cancellationToken = default);
 }

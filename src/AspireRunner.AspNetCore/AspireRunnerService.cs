@@ -5,12 +5,12 @@ using Microsoft.Extensions.Options;
 namespace AspireRunner.AspNetCore;
 
 public partial class AspireRunnerService(
-    IDashboardFactory factory,
+    IProcessFactory processFactory,
     IOptions<DashboardOptions> options,
     ILogger<AspireRunnerService> logger,
     IDashboardInstaller? installer = null) : IHostedService
 {
-    private Dashboard? _aspireDashboard;
+    private IDashboard? _aspireDashboard;
 
     public Task StartAsync(CancellationToken cancellationToken)
     {
@@ -52,7 +52,7 @@ public partial class AspireRunnerService(
 
         await RunInstallerAsync(cancellationToken);
 
-        _aspireDashboard = await factory.CreateDashboardAsync(options.Value);
+        _aspireDashboard = await processFactory.CreateAspireDashboardAsync(options.Value);
         if (_aspireDashboard is null)
         {
             WarnNotInstalled();

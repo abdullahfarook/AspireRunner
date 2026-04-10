@@ -1,0 +1,10 @@
+{
+  "name": "aspire-runner-processmanager-tests",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Local test harness dependencies for AspireRunner process manager integration checks.",
+  "license": "UNLICENSED",
+  "dependencies": {
+    "express": "^4.21.2"
+  }
+}

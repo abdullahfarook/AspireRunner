@@ -1,0 +1,286 @@
+using AspireRunner.Core.Abstractions;
+using AspireRunner.Core.Models;
+using AspireRunner.Tool.ProcessManager;
+using AspireRunner.Tool.ProcessManager.Lpc;
+using Microsoft.Extensions.Logging;
+using System.ComponentModel;
+using System.Text;
+
+namespace AspireRunner.Tool.Commands;
+
+public class ProcessRunCommand : AsyncCommand<ProcessRunCommand.Settings>
+{
+    public class Settings : CommandSettings
+    {
+        [CommandArgument(0, "<exe>")]
+        [Description("Path or command name of the executable to run")]
+        public required string Executable { get; set; }
+
+        [CommandOption("--args")]
+        [Description("Arguments string passed to the executable (use --args=\"...\" when values start with '-')")]
+        public string? Arguments { get; set; }
+
+        [CommandOption("--name")]
+        [Description("Display name for the managed process")]
+        public string? Name { get; set; }
+
+        [CommandOption("--id")]
+        [Description("Process id in the session inventory")]
+        public string? ProcessId { get; set; }
+
+        [CommandOption("--working-dir")]
+        [Description("Working directory for the process")]
+        public string? WorkingDirectory { get; set; }
+
+        [CommandOption("--env")]
+        [Description("Environment variable in KEY=VALUE format. Pass multiple times to add more entries")]
+        public string[] EnvironmentEntries { get; set; } = [];
+
+        [CommandOption("--detach")]
+        [Description("Start the process and return immediately")]
+        public bool Detach { get; set; }
+
+        [CommandOption("--restart-on-failure")]
+        [Description("Automatically restart the process when it exits unexpectedly")]
+        public bool RestartOnFailure { get; set; }
+
+        [DefaultValue(2)]
+        [CommandOption("--restart-delay")]
+        [Description("Delay in seconds before restarting after an unexpected exit")]
+        public int RestartDelaySeconds { get; set; }
+
+        [DefaultValue(true)]
+        [CommandOption("--pipe-output")]
+        [Description("Write process output directly to the terminal")]
+        public bool PipeOutput { get; set; }
+    }
+
+    protected override async Task<int> ExecuteAsync(CommandContext context, Settings settings, CancellationToken cancellationToken)
+    {
+        _ = context;
+
+        Widgets.Write([Widgets.Header(), Widgets.RunnerVersion]);
+        Widgets.WriteLines(2);
+
+        var parseResult = ParseEnvironmentVariables(settings.EnvironmentEntries);
+        if (parseResult.InvalidEntries.Length > 0)
+        {
+            Widgets.Write(Widgets.Error($"Invalid --env entries: {string.Join(", ", parseResult.InvalidEntries)}"));
+            return 2;
+        }
+
+        var displayName = string.IsNullOrWhiteSpace(settings.Name)
+            ? Path.GetFileNameWithoutExtension(settings.Executable)
+            : settings.Name;
+
+        var processOptions = new ExecutableProcessOptions
+        {
+            ExecutablePath = settings.Executable,
+            DisplayName = string.IsNullOrWhiteSpace(displayName) ? "Managed Process" : displayName,
+            Arguments = ParseArguments(settings.Arguments),
+            WorkingDirectory = string.IsNullOrWhiteSpace(settings.WorkingDirectory) ? null : settings.WorkingDirectory,
+            EnvironmentVariables = parseResult.EnvironmentVariables,
+            PipeOutput = settings.PipeOutput,
+            RestartOnFailure = settings.RestartOnFailure,
+            RestartDelaySeconds = Math.Max(settings.RestartDelaySeconds, 1)
+        };
+
+        IProcessFactory processFactory = new ProcessFactory(
+            Logger.DefaultFactory.CreateLogger<ProcessFactory>(),
+            Logger.DefaultFactory);
+        using var lpcServer = StartLpcServer(processFactory);
+        if (lpcServer is not null)
+        {
+            Widgets.WriteInterpolated($"LPC endpoint [{Widgets.PrimaryColorText}]127.0.0.1:{lpcServer.Port}[/] is available for ProcessManager.Client", true);
+        }
+
+        var process = await processFactory.CreateProcessAsync(ProcessCreationRequest.Executable(processOptions));
+        if (process is null)
+        {
+            Widgets.Write(Widgets.Error("Failed to create process manager instance"));
+            return -1;
+        }
+
+        await process.StartAsync(cancellationToken);
+        if (!process.IsRunning)
+        {
+            Widgets.Write(Widgets.Error($"Failed to start process '{process.DisplayName}'"));
+            return -1;
+        }
+
+        var processCommand = BuildCommandPreview(settings.Executable, processOptions.Arguments);
+        var processEntry = InMemoryProcessManager.Instance.Register(
+            process,
+            ProcessProfile.ExecutableProcess,
+            command: processCommand,
+            details: BuildProcessDetails(process, processOptions),
+            preferredId: settings.ProcessId,
+            executable: settings.Executable,
+            arguments: settings.Arguments ?? string.Empty,
+            environmentVariables: BuildEnvironmentString(parseResult.EnvironmentVariables),
+            workingDirectory: processOptions.WorkingDirectory);
+
+        Widgets.WriteInterpolated($"Started process [{Widgets.PrimaryColorText}]{process.DisplayName}[/] with PID [{Widgets.PrimaryColorText}]{process.Pid}[/] (id: [{Widgets.PrimaryColorText}]{processEntry.Id}[/])", true);
+
+        if (settings.Detach)
+        {
+            Widgets.WriteInterpolated($"Process is running in detached mode", true);
+            return 0;
+        }
+
+        Widgets.Write("Press Ctrl+C to stop the process", true);
+
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        ConsoleCancelEventHandler cancelHandler = (_, e) =>
+        {
+            e.Cancel = true;
+            process.StopAsync(CancellationToken.None).GetAwaiter().GetResult();
+            linkedCts.Cancel();
+        };
+
+        Console.CancelKeyPress += cancelHandler;
+        try
+        {
+            await process.WaitForExitAsync(linkedCts.Token);
+        }
+        catch (OperationCanceledException)
+        {
+            // Stopped by cancellation (Ctrl+C or host cancellation).
+        }
+        finally
+        {
+            Console.CancelKeyPress -= cancelHandler;
+            InMemoryProcessManager.Instance.UpdateMetadata(processEntry.Id, processCommand, BuildProcessDetails(process, processOptions));
+        }
+
+        return 0;
+    }
+
+    private static string BuildProcessDetails(IManagedProcess process, ExecutableProcessOptions options)
+    {
+        var details = new List<string>();
+        if (!string.IsNullOrWhiteSpace(options.WorkingDirectory))
+        {
+            details.Add($"cwd={options.WorkingDirectory}");
+        }
+
+        if (options.Arguments.Count > 0)
+        {
+            details.Add($"args={string.Join(' ', options.Arguments)}");
+        }
+
+        details.Add(process.IsRunning ? "running" : "stopped");
+        return string.Join(", ", details);
+    }
+
+    private static string BuildCommandPreview(string executable, IReadOnlyList<string> arguments)
+    {
+        if (arguments.Count == 0)
+        {
+            return executable;
+        }
+
+        return $"{executable} {string.Join(' ', arguments)}";
+    }
+
+    private static string? BuildEnvironmentString(IReadOnlyDictionary<string, string?> environmentVariables)
+    {
+        if (environmentVariables.Count == 0)
+        {
+            return null;
+        }
+
+        return string.Join(";", environmentVariables.Select(e => $"{e.Key}={e.Value}"));
+    }
+
+    private static LpcServer? StartLpcServer(IProcessFactory processFactory)
+    {
+        var server = new LpcServer(
+            InMemoryProcessManager.Instance,
+            processFactory,
+            Logger.DefaultFactory.CreateLogger<LpcServer>(),
+            LpcServer.DefaultPort);
+
+        if (server.Start())
+        {
+            return server;
+        }
+
+        server.Dispose();
+        return null;
+    }
+
+    private static string[] ParseArguments(string? rawArguments)
+    {
+        if (string.IsNullOrWhiteSpace(rawArguments))
+        {
+            return [];
+        }
+
+        var inQuotes = false;
+        var tokens = new List<string>();
+        var current = new StringBuilder();
+
+        foreach (var character in rawArguments.Trim())
+        {
+            if (character == '"')
+            {
+                inQuotes = !inQuotes;
+                continue;
+            }
+
+            if (char.IsWhiteSpace(character) && !inQuotes)
+            {
+                if (current.Length > 0)
+                {
+                    tokens.Add(current.ToString());
+                    current.Clear();
+                }
+
+                continue;
+            }
+
+            current.Append(character);
+        }
+
+        if (current.Length > 0)
+        {
+            tokens.Add(current.ToString());
+        }
+
+        return [..tokens];
+    }
+
+    private static (IReadOnlyDictionary<string, string?> EnvironmentVariables, string[] InvalidEntries) ParseEnvironmentVariables(IEnumerable<string> entries)
+    {
+        var variables = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
+        var invalidEntries = new List<string>();
+
+        foreach (var entry in entries)
+        {
+            if (string.IsNullOrWhiteSpace(entry))
+            {
+                continue;
+            }
+
+            var separatorIndex = entry.IndexOf('=');
+            if (separatorIndex <= 0)
+            {
+                invalidEntries.Add(entry);
+                continue;
+            }
+
+            var key = entry[..separatorIndex].Trim();
+            var value = entry[(separatorIndex + 1)..];
+            if (string.IsNullOrWhiteSpace(key))
+            {
+                invalidEntries.Add(entry);
+                continue;
+            }
+
+            variables[key] = value;
+        }
+
+        return (variables, [..invalidEntries]);
+    }
+}

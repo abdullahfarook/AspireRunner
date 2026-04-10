@@ -2,7 +2,6 @@
 using AspireRunner.Tool.Commands;
 using System.Text;
 
-// Ensure console is using UTF-8 encoding
 Console.OutputEncoding = Encoding.UTF8;
 
 var app = new CommandApp();
@@ -22,15 +21,32 @@ app.Configure(config =>
         return -99;
     });
 
-    // Register commands
-    config.AddCommand<RunCommand>("run");
-    config.AddCommand<InstallCommand>("install");
-    config.AddCommand<UninstallCommand>("uninstall");
-    config.AddCommand<CleanupCommand>("cleanup").WithDescription("Remove old versions of the dashboard and other temporary files");
+    config.AddBranch("aspire", aspire =>
+    {
+        aspire.AddCommand<RunCommand>("run");
+        aspire.AddCommand<InstallCommand>("install");
+        aspire.AddCommand<UninstallCommand>("uninstall");
+        aspire.AddCommand<CleanupCommand>("cleanup")
+            .WithDescription("Remove old versions of the dashboard and other temporary files");
+        aspire.SetDefaultCommand<RunCommand>();
+    });
+
+    config.AddBranch("process", process =>
+    {
+        process.AddCommand<ProcessRunCommand>("run")
+            .WithDescription("Run and manage a generic executable process");
+        process.AddCommand<ProcessListCommand>("list")
+            .WithDescription("List managed processes in the current session inventory");
+        process.AddCommand<ProcessStopCommand>("stop")
+            .WithDescription("Stop a managed process by id");
+        process.AddCommand<ProcessRestartCommand>("restart")
+            .WithDescription("Restart a managed process by id");
+        process.AddCommand<ProcessRemoveCommand>("remove")
+            .WithDescription("Remove a managed process from inventory");
+        process.SetDefaultCommand<ProcessRunCommand>();
+    });
 });
 
-app.SetDefaultCommand<RunCommand>().WithDescription($"Aspire Runner v{RunnerInfo.Version}");
 var exitCode = await app.RunAsync(args);
-
 AnsiConsole.Cursor.Show();
 return exitCode;

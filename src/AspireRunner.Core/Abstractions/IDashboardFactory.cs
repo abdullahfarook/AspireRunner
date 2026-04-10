@@ -1,6 +1,7 @@
 ﻿namespace AspireRunner.Core.Abstractions;
 
+[Obsolete("Use IProcessFactory instead.")]
 public interface IDashboardFactory
 {
-    Task<Dashboard?> CreateDashboardAsync(DashboardOptions options);
+    Task<IDashboard?> CreateDashboardAsync(DashboardOptions options);
 }

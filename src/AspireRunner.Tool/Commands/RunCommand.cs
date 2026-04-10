@@ -1,7 +1,13 @@
-﻿using AspireRunner.Installer;
+﻿using AspireRunner.Core.Abstractions;
+using AspireRunner.Core.Extensions;
+using AspireRunner.Core.Models;
+using AspireRunner.Installer;
+using AspireRunner.Tool.ProcessManager;
+using AspireRunner.Tool.ProcessManager.Lpc;
 using Microsoft.Extensions.Logging;
 using Spectre.Console.Rendering;
 using System.ComponentModel;
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 
 namespace AspireRunner.Tool.Commands;
@@ -98,11 +104,14 @@ public class RunCommand : AsyncCommand<RunCommand.Settings>
         public bool? Verbose { get; set; }
     }
 
-    private Dashboard? _dashboard;
+    private IDashboard? _dashboard;
     private bool _dashboardStarted;
     private LogRecord[] _currentLog = [];
     private int _currentWidth = AnsiConsole.Profile.Width;
     private int _currentHeight = AnsiConsole.Profile.Height;
+    private readonly InMemoryProcessManager _processManager = InMemoryProcessManager.Instance;
+    private string _inventoryState = string.Empty;
+    private string? _dashboardProcessId;
 
     protected override async Task<int> ExecuteAsync(CommandContext context, Settings settings, CancellationToken cancellationToken)
     {
@@ -134,13 +143,26 @@ public class RunCommand : AsyncCommand<RunCommand.Settings>
             }
         }
 
+        using var sessionCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var sessionToken = sessionCts.Token;
+
         // Register runner signal handlers
         using var sigInt = PosixSignalRegistration.Create(PosixSignal.SIGINT, SignalHandler);
         using var sigTerm = PosixSignalRegistration.Create(PosixSignal.SIGTERM, SignalHandler);
 
         // Create and start the dashboard
-        var dashboardFactory = new DashboardFactory(Logger.DefaultFactory.CreateLogger<DashboardFactory>(), Logger.DefaultFactory);
-        _dashboard = await dashboardFactory.CreateDashboardAsync(dashboardOptions);
+        var processFactory = new ProcessFactory(Logger.DefaultFactory.CreateLogger<ProcessFactory>(), Logger.DefaultFactory);
+        using var lpcServer = StartLpcServer(processFactory, () =>
+        {
+            sessionCts.Cancel();
+            return Task.CompletedTask;
+        });
+        if (lpcServer is not null)
+        {
+            Widgets.WriteInterpolated($"LPC endpoint [{Widgets.PrimaryColorText}]127.0.0.1:{lpcServer.Port}[/] is available for ProcessManager.Client", true);
+        }
+
+        _dashboard = await processFactory.CreateAspireDashboardAsync(dashboardOptions);
         if (_dashboard is null)
         {
             Widgets.Write("No dashboards found. Installing the latest version...", true);
@@ -150,7 +172,7 @@ public class RunCommand : AsyncCommand<RunCommand.Settings>
                 return installationResult;
             }
 
-            _dashboard = await dashboardFactory.CreateDashboardAsync(dashboardOptions);
+            _dashboard = await processFactory.CreateAspireDashboardAsync(dashboardOptions);
             if (_dashboard is null)
             {
                 Widgets.Write(Widgets.Error("Failed to create a dashboard instance after installation"));
@@ -160,13 +182,13 @@ public class RunCommand : AsyncCommand<RunCommand.Settings>
 
         if (settings.Version is not null && !VersionRange.Parse(settings.Version, true).IsSatisfied(_dashboard.Version))
         {
-            Widgets.Write(Widgets.Error($"No version matching '{settings.Version}' is installed, run '{RunnerInfo.CommandName} install {settings.Version}' to install it"));
+            Widgets.Write(Widgets.Error($"No version matching '{settings.Version}' is installed, run '{RunnerInfo.CommandName} aspire install {settings.Version}' to install it"));
             return 2;
         }
 
         Widgets.WriteInterpolated($"Found dashboard version [{Widgets.PrimaryColorText}]{_dashboard.Version}[/] at {_dashboard.InstallationPath}", true);
 
-        await _dashboard.StartAsync(CancellationToken.None);
+        await _dashboard.StartAsync(sessionToken);
         _dashboardStarted = _dashboard.IsRunning;
 
         if (!_dashboardStarted)
@@ -182,6 +204,8 @@ public class RunCommand : AsyncCommand<RunCommand.Settings>
             return -1;
         }
 
+        SyncDashboardInventory();
+
         // Prepare the main layout
         var defaultStatus = Widgets.StatusSymbol(false);
         var table = new Table()
@@ -195,6 +219,8 @@ public class RunCommand : AsyncCommand<RunCommand.Settings>
             .AddRow("OTLP/gRPC".Widget(), defaultStatus)
             .AddRow("OTLP/HTTP".Widget(), defaultStatus)
             .AddRow("MCP".Widget(), defaultStatus);
+
+        var inventoryTable = BuildInventoryTable();
 
         var actions = new Columns(
             Widgets.KeyActionDescriptor("S", "Stop"),
@@ -215,9 +241,12 @@ public class RunCommand : AsyncCommand<RunCommand.Settings>
         var mainLayout = new Layout("main").SplitRows(
             new Layout("header", new Align(new Rows(header, Widgets.RunnerVersion).Collapse(), HorizontalAlignment.Left, VerticalAlignment.Top)).Ratio(headerRatio),
             new Layout("log", BuildLogPanel().Panel).Ratio(5),
-            new Layout("table", new Align(table, HorizontalAlignment.Left, VerticalAlignment.Bottom)).Ratio(6),
+            new Layout("table", new Align(table, HorizontalAlignment.Left, VerticalAlignment.Bottom)).Ratio(4),
+            new Layout("inventory", new Align(inventoryTable, HorizontalAlignment.Left, VerticalAlignment.Bottom)).Ratio(7),
             new Layout("prompt", new Align(actions, HorizontalAlignment.Left, VerticalAlignment.Bottom)).Ratio(1)
         );
+
+        UpdateInventoryPanel();
 
         // Render the live layout (with spinners) while the dashboard is still initializing
         await RenderLiveInitializationAsync();
@@ -225,11 +254,12 @@ public class RunCommand : AsyncCommand<RunCommand.Settings>
         // Re-render the static layout
         mainLayout.Render();
 
-        while (true)
+        while (!sessionToken.IsCancellationRequested)
         {
             if (CheckDashboardStatusChanged()
                 | CheckConsoleSizeChanged()
-                | CheckLogEntries())
+                | CheckLogEntries()
+                | CheckInventoryChanged())
             {
                 mainLayout.Render();
             }
@@ -243,7 +273,7 @@ public class RunCommand : AsyncCommand<RunCommand.Settings>
                     {
                         await StopDashboardAsync();
 
-                        await _dashboard.StartAsync(cancellationToken);
+                        await _dashboard.StartAsync(sessionToken);
 
                         // Avoid launching the browser when restarting the dashboard
                         dashboardOptions.Runner.LaunchBrowser = false;
@@ -273,8 +303,8 @@ public class RunCommand : AsyncCommand<RunCommand.Settings>
                     }
                     case ConsoleKey.Escape:
                     {
-                        await StopDashboardAsync();
-                        return 0;
+                        sessionCts.Cancel();
+                        break;
                     }
                     case ConsoleKey.S:
                     {
@@ -284,8 +314,18 @@ public class RunCommand : AsyncCommand<RunCommand.Settings>
                 }
             }
 
-            await Task.Delay(5, cancellationToken).ConfigureAwait(false);
+            try
+            {
+                await Task.Delay(5, sessionToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
         }
+
+        await ShutdownManagedProcessesAsync();
+        return 0;
 
         async Task RenderLiveInitializationAsync()
         {
@@ -311,6 +351,7 @@ public class RunCommand : AsyncCommand<RunCommand.Settings>
 
                         mainLayout["prompt"].Update(currentPrompt);
                         UpdateTableCells(currentFrame);
+                        UpdateInventoryPanel();
                         ctx.Refresh();
 
                         if (_dashboard.Url != null && _dashboard.OtlpEndpoints?.Count == otlpEndpoints.Count && (dashboardOptions.Mcp.Disabled is true || _dashboard.McpEndpoint != null))
@@ -319,23 +360,26 @@ public class RunCommand : AsyncCommand<RunCommand.Settings>
                         }
 
                         frameIndex++;
-                        await Task.Delay(spinner.Interval, cancellationToken);
+                        await Task.Delay(spinner.Interval, sessionToken);
                     }
                 });
 
             mainLayout["prompt"].Update(new Align(actions, HorizontalAlignment.Left, VerticalAlignment.Bottom));
             UpdateTableCells(defaultStatus);
+            UpdateInventoryPanel();
         }
 
         async Task StopDashboardAsync()
         {
-            await _dashboard.StopAsync(cancellationToken);
+            await _dashboard.StopAsync(CancellationToken.None);
 
             _currentLog = [];
             mainLayout["log"].Update(BuildLogPanel().Panel);
 
             _dashboardStarted = false;
             ResetTableCells();
+            SyncDashboardInventory();
+            UpdateInventoryPanel();
 
             mainLayout.Render();
         }
@@ -444,6 +488,8 @@ public class RunCommand : AsyncCommand<RunCommand.Settings>
                 ResetTableCells();
             }
 
+            SyncDashboardInventory();
+
             return true;
         }
 
@@ -468,8 +514,167 @@ public class RunCommand : AsyncCommand<RunCommand.Settings>
             mainLayout["header"].Update(new Align(new Rows(header, Widgets.RunnerVersion).Collapse(), HorizontalAlignment.Left, VerticalAlignment.Top)).Ratio(headerRatio);
             mainLayout["log"].Update(BuildLogPanel().Panel);
             UpdateTableCells(defaultStatus);
+            UpdateInventoryPanel();
 
             return true;
+        }
+
+        bool CheckInventoryChanged()
+        {
+            SyncDashboardInventory();
+
+            var snapshot = BuildInventoryState();
+            if (snapshot == _inventoryState)
+            {
+                return false;
+            }
+
+            UpdateInventoryPanel();
+            return true;
+        }
+
+        void SyncDashboardInventory()
+        {
+            if (_dashboard is null)
+            {
+                return;
+            }
+
+            var dashboardExe = DotnetCli.Executable;
+            var dashboardArgs = $"exec {Path.Combine(_dashboard.InstallationPath, Dashboard.DllName)}";
+            var dashboardEnvironment = dashboardOptions.ToEnvironmentVariables();
+            var command = $"{RunnerInfo.CommandName} aspire run {settings.Version}".TrimEnd();
+            var details = BuildDashboardDetails();
+
+            if (string.IsNullOrWhiteSpace(_dashboardProcessId))
+            {
+                var processEntry = _processManager.Register(
+                    _dashboard,
+                    ProcessProfile.AspireDashboard,
+                    command,
+                    details,
+                    preferredId: "aspire-dashboard",
+                    executable: dashboardExe,
+                    arguments: dashboardArgs,
+                    environmentVariables: BuildEnvironmentString(dashboardEnvironment),
+                    workingDirectory: _dashboard.InstallationPath);
+                _dashboardProcessId = processEntry.Id;
+                return;
+            }
+
+            _processManager.UpdateMetadata(
+                _dashboardProcessId,
+                command,
+                details,
+                executable: dashboardExe,
+                arguments: dashboardArgs,
+                environmentVariables: BuildEnvironmentString(dashboardEnvironment),
+                workingDirectory: _dashboard.InstallationPath);
+        }
+
+        Table BuildInventoryTable()
+        {
+            var inventory = new Table()
+                .Collapse()
+                .BorderStyle(new Style(Widgets.PrimaryColor, decoration: Decoration.Dim))
+                .AddColumn("Id", c => c.NoWrap().Width(18))
+                .AddColumn("Process", c => c.NoWrap().Width(26))
+                .AddColumn("Profile", c => c.Centered().NoWrap().Width(14))
+                .AddColumn("Status", c => c.Centered().NoWrap().Width(10))
+                .AddColumn("PID", c => c.Centered().NoWrap().Width(10))
+                .AddColumn("Details", c => c.NoWrap().Width(54));
+
+            var entries = _processManager.List();
+            if (entries.Count == 0)
+            {
+                inventory.AddRow(
+                    "-".Widget(),
+                    "No managed processes".Widget(),
+                    "".Widget(),
+                    "".Widget(),
+                    "".Widget(),
+                    "".Widget());
+                return inventory;
+            }
+
+            foreach (var entry in entries)
+            {
+                var running = entry.Process.IsRunning;
+                var profileText = entry.Profile switch
+                {
+                    ProcessProfile.AspireDashboard => "Aspire",
+                    ProcessProfile.ExecutableProcess => "Executable",
+                    _ => entry.Profile.ToString()
+                };
+
+                inventory.AddRow(
+                    entry.Id.Truncate(16).Widget(),
+                    entry.Process.DisplayName.Truncate(24).Widget(),
+                    profileText.Widget(),
+                    Widgets.TableColumn([Widgets.StatusSymbol(running)], HorizontalAlignment.Center),
+                    (entry.Process.Pid?.ToString() ?? string.Empty).Widget(),
+                    (entry.Details ?? string.Empty).Truncate(52).Widget());
+            }
+
+            return inventory;
+        }
+
+        void UpdateInventoryPanel()
+        {
+            mainLayout["inventory"].Update(new Align(BuildInventoryTable(), HorizontalAlignment.Left, VerticalAlignment.Bottom));
+            _inventoryState = BuildInventoryState();
+        }
+
+        string BuildInventoryState()
+        {
+            return string.Join('|', _processManager
+                .List()
+                .Select(e => $"{e.Id}:{e.Process.IsRunning}:{e.Process.Pid}:{e.Details}"));
+        }
+
+        string BuildDashboardDetails()
+        {
+            if (_dashboard is null)
+            {
+                return string.Empty;
+            }
+
+            var details = new List<string>();
+            details.Add(_dashboard.IsRunning ? "running" : "stopped");
+
+            if (_dashboard.Url is { } dashboardUrl)
+            {
+                details.Add($"url={UrlHelper.ReplaceDefaultRoute(dashboardUrl)}");
+            }
+
+            if (otlpEndpoints.Contains("grpc"))
+            {
+                var grpcReady = _dashboard.OtlpEndpoints?.Any(e => e.Protocol.Contains("grpc", StringComparison.OrdinalIgnoreCase)) is true;
+                details.Add(grpcReady ? $"grpc={settings.OtlpPort}" : "grpc=pending");
+            }
+
+            if (otlpEndpoints.Contains("http"))
+            {
+                var httpReady = _dashboard.OtlpEndpoints?.Any(e => e.Protocol.Contains("http", StringComparison.OrdinalIgnoreCase)) is true;
+                details.Add(httpReady ? $"http={settings.OtlpHttpPort ?? OtlpOptions.DefaultOtlpHttpPort}" : "http=pending");
+            }
+
+            if (dashboardOptions.Mcp.Disabled is false)
+            {
+                details.Add(_dashboard.McpEndpoint is null ? "mcp=pending" : $"mcp={settings.McpPort}");
+            }
+
+            return string.Join(", ", details);
+        }
+
+        string? BuildEnvironmentString(IReadOnlyDictionary<string, string?> environmentVariables)
+        {
+            if (environmentVariables.Count == 0)
+            {
+                return null;
+            }
+
+            return string.Join(";", environmentVariables.Select(e => $"{e.Key}={e.Value}"));
         }
 
         bool CheckLogEntries()
@@ -485,7 +690,34 @@ public class RunCommand : AsyncCommand<RunCommand.Settings>
 
         void SignalHandler(PosixSignalContext _)
         {
-            _dashboard?.StopAsync(cancellationToken).Wait(cancellationToken);
+            _.Cancel = true;
+            sessionCts.Cancel();
+        }
+
+        async Task ShutdownManagedProcessesAsync()
+        {
+            var dashboardPid = _dashboard?.Pid;
+
+            await _processManager.StopAllAsync(CancellationToken.None);
+            await _processManager.RemoveAllAsync(stopIfRunning: false, CancellationToken.None);
+
+            if (dashboardPid is int pid)
+            {
+                TryTerminateProcessByPid(pid);
+            }
+        }
+
+        static void TryTerminateProcessByPid(int pid)
+        {
+            try
+            {
+                var process = Process.GetProcessById(pid);
+                process.Kill(entireProcessTree: true);
+            }
+            catch
+            {
+                // Ignore failures when process has already exited.
+            }
         }
     }
 
@@ -585,5 +817,23 @@ public class RunCommand : AsyncCommand<RunCommand.Settings>
         }
 
         return enabledEndpoints;
+    }
+
+    private static LpcServer? StartLpcServer(IProcessFactory processFactory, Func<Task>? shutdownRequested)
+    {
+        var server = new LpcServer(
+            InMemoryProcessManager.Instance,
+            processFactory,
+            Logger.DefaultFactory.CreateLogger<LpcServer>(),
+            LpcServer.DefaultPort,
+            shutdownRequested);
+
+        if (server.Start())
+        {
+            return server;
+        }
+
+        server.Dispose();
+        return null;
     }
 }
