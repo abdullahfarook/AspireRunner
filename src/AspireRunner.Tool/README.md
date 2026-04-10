@@ -85,6 +85,8 @@ OPTIONS:
     - `H`: Open project documentation/help
     - `Esc` or `Ctrl+C`: Exit the runner
 
+    Ports shown in the managed-process table are hyperlinks and can be opened directly from supporting terminals.
+
 ### Install command
 
 ```bash
@@ -197,9 +199,10 @@ aspire-dashboard process remove <id> [--keep-running]
 The `aspire-dashboard aspire run` terminal UI includes integrated, bounded panels for:
 
 - Managed process inventory (with keyboard selection)
+- Managed process inventory (with clickable port links)
 - Selected-process logs (history + live stream)
 - Aspire service status
-- Aspire logs
+- Selected process details (runtime metadata)
 - Inline controls/status footer
 
 You can manage processes directly from the main dashboard without opening a separate process view.

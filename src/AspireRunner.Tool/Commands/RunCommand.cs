@@ -116,8 +116,6 @@ public class RunCommand : AsyncCommand<RunCommand.Settings>
     protected override async Task<int> ExecuteAsync(CommandContext context, Settings settings, CancellationToken cancellationToken)
     {
         Logger.Verbose = settings.Verbose ?? false;
-        Widgets.Write([Widgets.Header(), Widgets.RunnerVersion]);
-        Widgets.WriteLines(2);
 
         if (string.IsNullOrEmpty(DotnetCli.Path))
         {
@@ -234,41 +232,37 @@ public class RunCommand : AsyncCommand<RunCommand.Settings>
 
         var actionStatus = "Select a process, then use S/R/D actions. Logs panel includes history + live updates.";
         var selectedProcessId = string.Empty;
-        var processLogLines = new List<string>();
+        var processLogEntries = new List<(string Stream, string Message)>();
         var processLogCursors = new Dictionary<string, (int StdoutCount, int StderrCount)>(StringComparer.OrdinalIgnoreCase);
         var processLogsProcessId = string.Empty;
         var reloadSelectedProcessLogs = true;
+        var serviceStatusState = string.Empty;
+        var selectedDetailsState = string.Empty;
         const int maxProcessLogLines = 300;
 
-        var headerRatio = 5;
-        var header = Widgets.LargeHeader;
-        if (Widgets.IsSmol())
-        {
-            headerRatio = 2;
-            header = Widgets.SmallHeader;
-        }
-
-        var initialAspireLogContent = BuildLogPanel().Panel;
-
         var mainLayout = new Layout("main").SplitRows(
-            new Layout("header", new Align(new Rows(header, Widgets.RunnerVersion).Collapse(), HorizontalAlignment.Left, VerticalAlignment.Top)).Ratio(headerRatio),
+            new Layout("header", BuildHeader()).Ratio(1),
             new Layout("body").SplitColumns(
                 new Layout("left").SplitRows(
                     new Layout("processes", BuildProcessPanel()).Ratio(7),
-                    new Layout("process-logs", BuildProcessLogsPanel()).Ratio(6)
+                    new Layout("process-logs", BuildProcessLogsPanel()).Ratio(8)
                 ).Ratio(3),
                 new Layout("right").SplitRows(
-                    new Layout("aspire-status", BuildAspireStatusPanel()).Ratio(4),
-                    new Layout("aspire-logs", BuildAspireLogsPanel(initialAspireLogContent)).Ratio(6)
+                    new Layout("aspire-status", BuildAspireStatusPanel()).Ratio(5),
+                    new Layout("process-details", BuildProcessDetailsPanel()).Ratio(8)
                 ).Ratio(2)
-            ).Ratio(12),
+            ).Ratio(14),
             new Layout("footer", BuildFooterPanel()).Ratio(2)
         );
 
         EnsureSelectedProcess();
+        UpdateAspireStatusPanel();
         UpdateProcessPanel();
+        UpdateProcessDetailsPanel();
         UpdateProcessLogsPanel(forceReload: true);
         UpdateFooterPanel();
+        serviceStatusState = BuildServiceStatusState();
+        selectedDetailsState = BuildSelectedProcessDetailsState();
 
         ConsoleCancelEventHandler cancelHandler = (_, e) =>
         {
@@ -283,105 +277,114 @@ public class RunCommand : AsyncCommand<RunCommand.Settings>
             // Render the live layout (with spinners) while the dashboard is still initializing
             await RenderLiveInitializationAsync();
 
-            // Re-render the static layout
-            mainLayout.Render();
-
-            while (!sessionToken.IsCancellationRequested)
-            {
-                if (CheckDashboardStatusChanged()
-                    | CheckConsoleSizeChanged()
-                    | CheckAspireLogEntries()
-                    | CheckInventoryChanged()
-                    | CheckSelectedProcessLogEntries())
+            await AnsiConsole.Live(mainLayout)
+                .Overflow(VerticalOverflow.Crop)
+                .Cropping(VerticalOverflowCropping.Bottom)
+                .AutoClear(false)
+                .StartAsync(async ctx =>
                 {
-                    mainLayout.Render();
-                }
+                    ctx.Refresh();
 
-                if (Console.KeyAvailable)
-                {
-                    var pressedKey = Console.ReadKey(true);
-                    switch (pressedKey.Key)
+                    while (!sessionToken.IsCancellationRequested)
                     {
-                        case ConsoleKey.UpArrow:
+                        var shouldRefresh = CheckDashboardStatusChanged()
+                            | CheckServiceStatusChanged()
+                            | CheckConsoleSizeChanged()
+                            | CheckInventoryChanged()
+                            | CheckSelectedProcessLogEntries()
+                            | CheckSelectedProcessDetailsChanged();
+
+                        if (Console.KeyAvailable)
                         {
-                            MoveSelection(-1);
-                            mainLayout.Render();
-                            break;
-                        }
-                        case ConsoleKey.DownArrow:
-                        {
-                            MoveSelection(1);
-                            mainLayout.Render();
-                            break;
-                        }
-                        case ConsoleKey.L:
-                        {
-                            reloadSelectedProcessLogs = true;
-                            actionStatus = "Reloading selected process logs (history + live)...";
-                            UpdateFooterPanel();
-                            mainLayout.Render();
-                            break;
-                        }
-                        case ConsoleKey.S:
-                        {
-                            await StopSelectedProcessAsync();
-                            mainLayout.Render();
-                            break;
-                        }
-                        case ConsoleKey.R:
-                        {
-                            await RestartSelectedProcessAsync();
-                            mainLayout.Render();
-                            break;
-                        }
-                        case ConsoleKey.D:
-                        {
-                            await DeleteSelectedProcessAsync();
-                            mainLayout.Render();
-                            break;
-                        }
-                        case ConsoleKey.H or ConsoleKey.Help:
-                        {
-                            if (PlatformHelper.GetUrlOpener(RunnerInfo.ProjectUrl) is { } opener)
+                            var pressedKey = Console.ReadKey(true);
+                            var keyHandled = true;
+                            switch (pressedKey.Key)
                             {
-                                ProcessHelper.Run(opener.Executable, opener.Arguments);
-                                actionStatus = "Opened project documentation/help.";
-                                UpdateFooterPanel();
-                                mainLayout.Render();
+                                case ConsoleKey.UpArrow:
+                                {
+                                    MoveSelection(-1);
+                                    break;
+                                }
+                                case ConsoleKey.DownArrow:
+                                {
+                                    MoveSelection(1);
+                                    break;
+                                }
+                                case ConsoleKey.L:
+                                {
+                                    reloadSelectedProcessLogs = true;
+                                    actionStatus = "Reloading selected process logs (history + live)...";
+                                    UpdateFooterPanel();
+                                    break;
+                                }
+                                case ConsoleKey.S:
+                                {
+                                    await StopSelectedProcessAsync();
+                                    break;
+                                }
+                                case ConsoleKey.R:
+                                {
+                                    await RestartSelectedProcessAsync();
+                                    break;
+                                }
+                                case ConsoleKey.D:
+                                {
+                                    await DeleteSelectedProcessAsync();
+                                    break;
+                                }
+                                case ConsoleKey.H or ConsoleKey.Help:
+                                {
+                                    if (PlatformHelper.GetUrlOpener(RunnerInfo.ProjectUrl) is { } opener)
+                                    {
+                                        ProcessHelper.Run(opener.Executable, opener.Arguments);
+                                        actionStatus = "Opened project documentation/help.";
+                                        UpdateFooterPanel();
+                                    }
+
+                                    break;
+                                }
+                                case ConsoleKey.B:
+                                {
+                                    if (_dashboard is { IsRunning: true, Url: { } url } && PlatformHelper.GetUrlOpener(url) is { } opener)
+                                    {
+                                        ProcessHelper.Run(opener.Executable, opener.Arguments);
+                                        actionStatus = "Opened Aspire dashboard in browser.";
+                                        UpdateFooterPanel();
+                                    }
+
+                                    break;
+                                }
+                                case ConsoleKey.C when pressedKey.Modifiers.HasFlag(ConsoleModifiers.Control):
+                                case ConsoleKey.Escape:
+                                {
+                                    sessionCts.Cancel();
+                                    break;
+                                }
+                                default:
+                                {
+                                    keyHandled = false;
+                                    break;
+                                }
                             }
 
-                            break;
+                            shouldRefresh |= keyHandled;
                         }
-                        case ConsoleKey.B:
-                        {
-                            if (_dashboard is { IsRunning: true, Url: { } url } && PlatformHelper.GetUrlOpener(url) is { } opener)
-                            {
-                                ProcessHelper.Run(opener.Executable, opener.Arguments);
-                                actionStatus = "Opened Aspire dashboard in browser.";
-                                UpdateFooterPanel();
-                                mainLayout.Render();
-                            }
 
-                            break;
-                        }
-                        case ConsoleKey.C when pressedKey.Modifiers.HasFlag(ConsoleModifiers.Control):
-                        case ConsoleKey.Escape:
+                        if (shouldRefresh)
                         {
-                            sessionCts.Cancel();
+                            ctx.Refresh();
+                        }
+
+                        try
+                        {
+                            await Task.Delay(40, sessionToken).ConfigureAwait(false);
+                        }
+                        catch (OperationCanceledException)
+                        {
                             break;
                         }
                     }
-                }
-
-                try
-                {
-                    await Task.Delay(40, sessionToken).ConfigureAwait(false);
-                }
-                catch (OperationCanceledException)
-                {
-                    break;
-                }
-            }
+                }).ConfigureAwait(false);
 
             await ShutdownManagedProcessesAsync();
             return 0;
@@ -425,7 +428,9 @@ public class RunCommand : AsyncCommand<RunCommand.Settings>
                                 .Expand());
 
                             UpdateTableCells(currentFrame);
+                            UpdateAspireStatusPanel();
                             UpdateProcessPanel();
+                            UpdateProcessDetailsPanel();
                             UpdateProcessLogsPanel(forceReload: true);
                             ctx.Refresh();
 
@@ -460,14 +465,24 @@ public class RunCommand : AsyncCommand<RunCommand.Settings>
             }
 
             UpdateTableCells(defaultStatus);
+            UpdateAspireStatusPanel();
             UpdateProcessPanel();
+            UpdateProcessDetailsPanel();
             UpdateProcessLogsPanel(forceReload: true);
             actionStatus = "Runner ready. Select process and use S/R/D/L actions.";
             UpdateFooterPanel();
+            serviceStatusState = BuildServiceStatusState();
+            selectedDetailsState = BuildSelectedProcessDetailsState();
         }
 
         void UpdateTableCells(Renderable defaultContent)
         {
+            if (_dashboard is null)
+            {
+                ResetTableCells();
+                return;
+            }
+
             if (_dashboard.Url is null)
             {
                 table.UpdateCell(0, 1, defaultContent);
@@ -585,21 +600,15 @@ public class RunCommand : AsyncCommand<RunCommand.Settings>
             _currentWidth = AnsiConsole.Profile.Width;
             _currentHeight = AnsiConsole.Profile.Height;
 
-            headerRatio = 5;
-            header = Widgets.LargeHeader;
-            if (Widgets.IsSmol())
-            {
-                headerRatio = 2;
-                header = Widgets.SmallHeader;
-            }
-
-            mainLayout["header"].Update(new Align(new Rows(header, Widgets.RunnerVersion).Collapse(), HorizontalAlignment.Left, VerticalAlignment.Top)).Ratio(headerRatio);
+            mainLayout["header"].Update(BuildHeader()).Ratio(1);
             UpdateTableCells(defaultStatus);
-            mainLayout["aspire-status"].Update(BuildAspireStatusPanel());
-            mainLayout["aspire-logs"].Update(BuildAspireLogsPanel(BuildLogPanel().Panel));
+            UpdateAspireStatusPanel();
             UpdateProcessPanel();
+            UpdateProcessDetailsPanel();
             UpdateProcessLogsPanel(forceReload: true);
             UpdateFooterPanel();
+            serviceStatusState = BuildServiceStatusState();
+            selectedDetailsState = BuildSelectedProcessDetailsState();
 
             return true;
         }
@@ -616,7 +625,23 @@ public class RunCommand : AsyncCommand<RunCommand.Settings>
 
             EnsureSelectedProcess();
             UpdateProcessPanel();
+            UpdateProcessDetailsPanel();
             reloadSelectedProcessLogs = true;
+            return true;
+        }
+
+        bool CheckServiceStatusChanged()
+        {
+            var snapshot = BuildServiceStatusState();
+            if (snapshot == serviceStatusState)
+            {
+                return false;
+            }
+
+            serviceStatusState = snapshot;
+            UpdateTableCells(defaultStatus);
+            UpdateAspireStatusPanel();
+            SyncDashboardInventory();
             return true;
         }
 
@@ -672,7 +697,7 @@ public class RunCommand : AsyncCommand<RunCommand.Settings>
                 .AddColumn("Process", c => c.NoWrap().Width(24))
                 .AddColumn("Status", c => c.Centered().NoWrap().Width(8))
                 .AddColumn("PID", c => c.Centered().NoWrap().Width(8))
-                .AddColumn("Ports", c => c.Centered().NoWrap().Width(10))
+                .AddColumn("Ports", c => c.Centered().NoWrap().Width(18))
                 .AddColumn("Profile", c => c.Centered().NoWrap().Width(12));
 
             var entries = _processManager.List();
@@ -701,7 +726,6 @@ public class RunCommand : AsyncCommand<RunCommand.Settings>
 
                 var selected = selectedProcessId.Equals(entry.Id, StringComparison.OrdinalIgnoreCase);
                 var selector = selected ? $"[{Widgets.PrimaryColorText}]>[/]" : " ";
-                var ports = entry.ExposedPorts.Count == 0 ? string.Empty : string.Join(',', entry.ExposedPorts);
 
                 inventory.AddRow(
                     selector.Widget(),
@@ -709,11 +733,93 @@ public class RunCommand : AsyncCommand<RunCommand.Settings>
                     entry.Process.DisplayName.Truncate(24).Widget(),
                     Widgets.TableColumn([Widgets.StatusSymbol(running)], HorizontalAlignment.Center),
                     (entry.Process.Pid?.ToString() ?? string.Empty).Widget(),
-                    ports.Widget(),
+                    BuildPortLinks(entry.ExposedPorts),
                     profileText.Widget());
             }
 
             return inventory;
+        }
+
+        IRenderable BuildPortLinks(IReadOnlyList<int> ports)
+        {
+            if (ports.Count == 0)
+            {
+                return "-".Widget();
+            }
+
+            var links = string.Join("[grey],[/]", ports
+                .Where(port => port is > ushort.MinValue and <= ushort.MaxValue)
+                .OrderBy(port => port)
+                .Select(port => $"[{Widgets.PrimaryColorText}][link=http://127.0.0.1:{port}]{port}[/][/]"));
+
+            return new Markup(links);
+        }
+
+        IRenderable BuildHeader()
+        {
+            var rows = new Rows(
+                new Markup($"[{Widgets.PrimaryColorText} bold]Aspire Runner[/]"),
+                new Markup($"[{Widgets.PrimaryColorText} dim]v{RunnerInfo.Version}[/]"))
+                .Collapse();
+
+            return new Align(rows, HorizontalAlignment.Center, VerticalAlignment.Middle);
+        }
+
+        void UpdateAspireStatusPanel()
+        {
+            mainLayout["aspire-status"].Update(BuildAspireStatusPanel());
+        }
+
+        void UpdateProcessDetailsPanel()
+        {
+            mainLayout["process-details"].Update(BuildProcessDetailsPanel());
+            selectedDetailsState = BuildSelectedProcessDetailsState();
+        }
+
+        bool CheckSelectedProcessDetailsChanged()
+        {
+            var snapshot = BuildSelectedProcessDetailsState();
+            if (snapshot == selectedDetailsState)
+            {
+                return false;
+            }
+
+            UpdateProcessDetailsPanel();
+            return true;
+        }
+
+        string BuildServiceStatusState()
+        {
+            if (_dashboard is null)
+            {
+                return string.Empty;
+            }
+
+            var endpointState = string.Join(';', (_dashboard.OtlpEndpoints ?? [])
+                .Select(endpoint => $"{endpoint.Protocol}:{endpoint.Url}")
+                .OrderBy(item => item, StringComparer.OrdinalIgnoreCase));
+
+            return $"{_dashboard.IsRunning}|{_dashboard.Url}|{_dashboard.McpEndpoint}|{endpointState}";
+        }
+
+        string BuildSelectedProcessDetailsState()
+        {
+            var selected = GetSelectedProcessEntry();
+            if (selected is null)
+            {
+                return string.Empty;
+            }
+
+            return string.Join('|',
+                selected.Id,
+                selected.Process.IsRunning,
+                selected.Process.Pid,
+                selected.Profile,
+                selected.Command,
+                selected.Details,
+                selected.WorkingDirectory,
+                string.Join(',', selected.ExposedPorts),
+                selected.LastUpdatedAt.ToUnixTimeMilliseconds());
         }
 
         void UpdateProcessPanel()
@@ -750,13 +856,13 @@ public class RunCommand : AsyncCommand<RunCommand.Settings>
 
             if (selected is null)
             {
-                if (processLogLines.Count == 0 && string.IsNullOrWhiteSpace(processLogsProcessId))
+                if (processLogEntries.Count == 0 && string.IsNullOrWhiteSpace(processLogsProcessId))
                 {
                     return false;
                 }
 
                 processLogsProcessId = string.Empty;
-                processLogLines.Clear();
+                processLogEntries.Clear();
                 return true;
             }
 
@@ -765,7 +871,7 @@ public class RunCommand : AsyncCommand<RunCommand.Settings>
             if (forceReload || !processLogsProcessId.Equals(selected.Id, StringComparison.OrdinalIgnoreCase))
             {
                 processLogsProcessId = selected.Id;
-                processLogLines.Clear();
+                processLogEntries.Clear();
                 processLogCursors[selected.Id] = (0, 0);
                 changed = true;
             }
@@ -773,10 +879,10 @@ public class RunCommand : AsyncCommand<RunCommand.Settings>
             if (selected.Process is not IProcessOutputSource outputSource)
             {
                 var unsupportedMessage = "Selected process does not expose output streams.";
-                if (processLogLines.Count != 1 || !processLogLines[0].Equals(unsupportedMessage, StringComparison.Ordinal))
+                if (processLogEntries.Count != 1 || !processLogEntries[0].Message.Equals(unsupportedMessage, StringComparison.Ordinal))
                 {
-                    processLogLines.Clear();
-                    processLogLines.Add(unsupportedMessage);
+                    processLogEntries.Clear();
+                    processLogEntries.Add(("info", unsupportedMessage));
                     return true;
                 }
 
@@ -793,7 +899,7 @@ public class RunCommand : AsyncCommand<RunCommand.Settings>
 
             if (stdoutSnapshot.Count < cursor.StdoutCount || stderrSnapshot.Count < cursor.StderrCount)
             {
-                processLogLines.Clear();
+                processLogEntries.Clear();
                 cursor = (0, 0);
                 changed = true;
             }
@@ -821,10 +927,10 @@ public class RunCommand : AsyncCommand<RunCommand.Settings>
                 return;
             }
 
-            processLogLines.Add($"[{stream}] {line}");
-            if (processLogLines.Count > maxProcessLogLines)
+            processLogEntries.Add((stream, line));
+            if (processLogEntries.Count > maxProcessLogLines)
             {
-                processLogLines.RemoveRange(0, processLogLines.Count - maxProcessLogLines);
+                processLogEntries.RemoveRange(0, processLogEntries.Count - maxProcessLogLines);
             }
         }
 
@@ -845,9 +951,18 @@ public class RunCommand : AsyncCommand<RunCommand.Settings>
                 : $"Selected Process Logs ({selected.Process.DisplayName})";
 
             var visibleLines = Math.Max(AnsiConsole.Profile.Height / 5, 6);
-            var rows = processLogLines
+            var rows = processLogEntries
                 .TakeLast(visibleLines)
-                .Select(line => (IRenderable)new Text(line))
+                .Select(entry =>
+                {
+                    var style = entry.Stream.Equals("stderr", StringComparison.OrdinalIgnoreCase)
+                        ? "red"
+                        : entry.Stream.Equals("stdout", StringComparison.OrdinalIgnoreCase)
+                            ? "grey"
+                            : Widgets.PrimaryColorText;
+
+                    return (IRenderable)new Markup($"[{style}]{Markup.Escape(entry.Message)}[/]");
+                })
                 .ToArray();
 
             if (rows.Length == 0)
@@ -869,10 +984,54 @@ public class RunCommand : AsyncCommand<RunCommand.Settings>
                 .Expand();
         }
 
-        IRenderable BuildAspireLogsPanel(IRenderable content)
+        IRenderable BuildProcessDetailsPanel()
         {
-            return new Panel(content)
-                .Header($"[{Widgets.PrimaryColorText}]Aspire Logs[/]")
+            var selected = GetSelectedProcessEntry();
+            if (selected is null)
+            {
+                return new Panel(new Text("Select a process to inspect metadata and runtime details.", new Style(Color.Grey)))
+                    .Header($"[{Widgets.PrimaryColorText}]Process Details[/]")
+                    .BorderStyle(new Style(Widgets.PrimaryColor, decoration: Decoration.Dim))
+                    .Expand();
+            }
+
+            var profileText = selected.Profile switch
+            {
+                ProcessProfile.AspireDashboard => "Aspire",
+                ProcessProfile.ExecutableProcess => "Executable",
+                _ => selected.Profile.ToString()
+            };
+
+            var fields = new Grid()
+                .AddColumn(new GridColumn().NoWrap())
+                .AddColumn();
+
+            fields.AddRow("[grey]Name[/]".Widget(), selected.Process.DisplayName.Truncate(46).Widget());
+            fields.AddRow("[grey]Id[/]".Widget(), selected.Id.Truncate(46).Widget());
+            fields.AddRow("[grey]Status[/]".Widget(), new Markup(selected.Process.IsRunning ? "[green]Running[/]" : "[red]Stopped[/]"));
+            fields.AddRow("[grey]PID[/]".Widget(), (selected.Process.Pid?.ToString() ?? "-").Widget());
+            fields.AddRow("[grey]Profile[/]".Widget(), profileText.Widget());
+            fields.AddRow("[grey]Ports[/]".Widget(), BuildPortLinks(selected.ExposedPorts));
+
+            if (!string.IsNullOrWhiteSpace(selected.WorkingDirectory))
+            {
+                fields.AddRow("[grey]Work Dir[/]".Widget(), selected.WorkingDirectory.Truncate(46).Widget());
+            }
+
+            if (!string.IsNullOrWhiteSpace(selected.Command))
+            {
+                fields.AddRow("[grey]Command[/]".Widget(), selected.Command.Truncate(46).Widget());
+            }
+
+            if (!string.IsNullOrWhiteSpace(selected.Details))
+            {
+                fields.AddRow("[grey]Details[/]".Widget(), selected.Details.Truncate(46).Widget());
+            }
+
+            fields.AddRow("[grey]Updated[/]".Widget(), selected.LastUpdatedAt.LocalDateTime.ToString("HH:mm:ss").Widget());
+
+            return new Panel(fields)
+                .Header($"[{Widgets.PrimaryColorText}]Process Details[/]")
                 .BorderStyle(new Style(Widgets.PrimaryColor, decoration: Decoration.Dim))
                 .Expand();
         }
@@ -941,6 +1100,7 @@ public class RunCommand : AsyncCommand<RunCommand.Settings>
             actionStatus = $"Selected process: {entries[nextIndex].Process.DisplayName}";
 
             UpdateProcessPanel();
+            UpdateProcessDetailsPanel();
             UpdateProcessLogsPanel(forceReload: true);
             UpdateFooterPanel();
         }
@@ -955,14 +1115,24 @@ public class RunCommand : AsyncCommand<RunCommand.Settings>
                 return;
             }
 
+            var selectedDashboard = selected.Id.Equals(_dashboardProcessId, StringComparison.OrdinalIgnoreCase);
             var stopped = await _processManager.StopAsync(selected.Id, CancellationToken.None).ConfigureAwait(false);
             actionStatus = stopped
                 ? $"Stopped process: {selected.Process.DisplayName}"
                 : $"Failed to stop process: {selected.Process.DisplayName}";
 
+            if (selectedDashboard)
+            {
+                _dashboardStarted = _dashboard?.IsRunning is true;
+                serviceStatusState = string.Empty;
+                UpdateTableCells(defaultStatus);
+                UpdateAspireStatusPanel();
+            }
+
             SyncDashboardInventory();
             reloadSelectedProcessLogs = true;
             UpdateProcessPanel();
+            UpdateProcessDetailsPanel();
             UpdateProcessLogsPanel(forceReload: true);
             UpdateFooterPanel();
         }
@@ -977,14 +1147,31 @@ public class RunCommand : AsyncCommand<RunCommand.Settings>
                 return;
             }
 
+            var selectedDashboard = selected.Id.Equals(_dashboardProcessId, StringComparison.OrdinalIgnoreCase);
+            if (selectedDashboard)
+            {
+                _dashboardStarted = false;
+                ResetTableCells();
+                UpdateAspireStatusPanel();
+            }
+
             var restarted = await _processManager.RestartAsync(selected.Id, CancellationToken.None).ConfigureAwait(false);
             actionStatus = restarted
                 ? $"Restarted process: {selected.Process.DisplayName}"
                 : $"Failed to restart process: {selected.Process.DisplayName}";
 
+            if (selectedDashboard)
+            {
+                _dashboardStarted = _dashboard?.IsRunning is true;
+                serviceStatusState = string.Empty;
+                UpdateTableCells(defaultStatus);
+                UpdateAspireStatusPanel();
+            }
+
             SyncDashboardInventory();
             reloadSelectedProcessLogs = true;
             UpdateProcessPanel();
+            UpdateProcessDetailsPanel();
             UpdateProcessLogsPanel(forceReload: true);
             UpdateFooterPanel();
         }
@@ -1007,37 +1194,30 @@ public class RunCommand : AsyncCommand<RunCommand.Settings>
             if (selected.Id.Equals(_dashboardProcessId, StringComparison.OrdinalIgnoreCase))
             {
                 _dashboardProcessId = null;
+                _dashboardStarted = _dashboard?.IsRunning is true;
+                serviceStatusState = string.Empty;
+                UpdateTableCells(defaultStatus);
+                UpdateAspireStatusPanel();
             }
 
             selectedProcessId = string.Empty;
             processLogsProcessId = string.Empty;
-            processLogLines.Clear();
+            processLogEntries.Clear();
 
             SyncDashboardInventory();
             EnsureSelectedProcess();
             reloadSelectedProcessLogs = true;
             UpdateProcessPanel();
+            UpdateProcessDetailsPanel();
             UpdateProcessLogsPanel(forceReload: true);
             UpdateFooterPanel();
-        }
-
-        bool CheckAspireLogEntries()
-        {
-            var (newContent, logUpdated) = BuildLogPanel();
-            if (!logUpdated)
-            {
-                return false;
-            }
-
-            mainLayout["aspire-logs"].Update(BuildAspireLogsPanel(newContent));
-            return true;
         }
 
         string BuildInventoryState()
         {
             return string.Join('|', _processManager
                 .List()
-                .Select(e => $"{e.Id}:{e.Process.IsRunning}:{e.Process.Pid}:{e.Details}"));
+                .Select(e => $"{e.Id}:{e.Process.IsRunning}:{e.Process.Pid}:{e.Details}:{string.Join(',', e.ExposedPorts)}"));
         }
 
         string BuildDashboardDetails()
