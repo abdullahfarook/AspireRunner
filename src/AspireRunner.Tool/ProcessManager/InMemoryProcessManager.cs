@@ -201,9 +201,11 @@ public sealed class InMemoryProcessManager
             return false;
         }
 
-        if (entry.Process.IsRunning)
+        // Always perform stop cleanup first, even when the process is already marked stopped,
+        // so stale listener owners on exposed ports are force-released before restart.
+        if (!await StopAsync(id, cancellationToken).ConfigureAwait(false))
         {
-            await StopAsync(id, cancellationToken).ConfigureAwait(false);
+            return false;
         }
 
         await entry.Process.StartAsync(cancellationToken);
@@ -219,9 +221,9 @@ public sealed class InMemoryProcessManager
             return false;
         }
 
-        if (stopIfRunning && entry.Process.IsRunning)
+        if (stopIfRunning)
         {
-            await StopAsync(id, cancellationToken);
+            await StopAsync(id, cancellationToken).ConfigureAwait(false);
         }
 
         UpdateProcessState(entry);
@@ -240,28 +242,9 @@ public sealed class InMemoryProcessManager
 
             try
             {
-                if (entry.Process.IsRunning)
+                var wasRunning = entry.Process.IsRunning;
+                if (await StopAsync(entry.Id, cancellationToken).ConfigureAwait(false) && wasRunning)
                 {
-                    var pid = entry.Process.Pid ?? entry.LastKnownPid;
-                    var ports = entry.ExposedPorts;
-
-                    try
-                    {
-                        await entry.Process.StopAsync(cancellationToken);
-                    }
-                    catch
-                    {
-                        TryKillByPid(pid);
-                    }
-
-                    if (entry.Process.IsRunning)
-                    {
-                        TryKillByPid(pid);
-                    }
-
-                    await WaitForProcessExitAsync(pid, cancellationToken).ConfigureAwait(false);
-                    await EnsurePortsReleasedAsync(ports, pid, cancellationToken).ConfigureAwait(false);
-
                     stoppedCount++;
                 }
             }

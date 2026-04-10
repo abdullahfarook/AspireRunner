@@ -225,6 +225,7 @@ public class RunCommand : AsyncCommand<RunCommand.Settings>
             Widgets.KeyActionDescriptor("S", "Stop selected"),
             Widgets.KeyActionDescriptor("R", "Restart selected"),
             Widgets.KeyActionDescriptor("D", "Delete selected"),
+            Widgets.KeyActionDescriptor("K", "Kill all + exit"),
             Widgets.KeyActionDescriptor("B", "Open browser"),
             Widgets.KeyActionDescriptor("H", "Help"),
             Widgets.KeyActionDescriptor("Esc/Ctrl+C", "Exit")
@@ -238,6 +239,7 @@ public class RunCommand : AsyncCommand<RunCommand.Settings>
         var reloadSelectedProcessLogs = true;
         var serviceStatusState = string.Empty;
         var selectedDetailsState = string.Empty;
+        var killRequested = false;
         const int maxProcessLogLines = 300;
 
         var mainLayout = new Layout("main").SplitRows(
@@ -332,6 +334,14 @@ public class RunCommand : AsyncCommand<RunCommand.Settings>
                                     await DeleteSelectedProcessAsync();
                                     break;
                                 }
+                                case ConsoleKey.K:
+                                {
+                                    killRequested = true;
+                                    actionStatus = "Killing runner and all managed processes...";
+                                    UpdateFooterPanel();
+                                    sessionCts.Cancel();
+                                    break;
+                                }
                                 case ConsoleKey.H or ConsoleKey.Help:
                                 {
                                     if (PlatformHelper.GetUrlOpener(RunnerInfo.ProjectUrl) is { } opener)
@@ -385,6 +395,12 @@ public class RunCommand : AsyncCommand<RunCommand.Settings>
                         }
                     }
                 }).ConfigureAwait(false);
+
+            if (killRequested)
+            {
+                await KillAllManagedProcessesAsync();
+                return 0;
+            }
 
             await ShutdownManagedProcessesAsync();
             return 0;
@@ -483,7 +499,9 @@ public class RunCommand : AsyncCommand<RunCommand.Settings>
                 return;
             }
 
-            if (_dashboard.Url is null)
+            var dashboardRunning = _dashboard.IsRunning;
+
+            if (!dashboardRunning || _dashboard.Url is null)
             {
                 table.UpdateCell(0, 1, defaultContent);
                 table.UpdateCell(0, 2, "");
@@ -500,7 +518,9 @@ public class RunCommand : AsyncCommand<RunCommand.Settings>
                 }
             }
 
-            if (!otlpEndpoints.Contains("grpc") || _dashboard.OtlpEndpoints?.FirstOrDefault(e => e.Protocol.Contains("grpc", StringComparison.OrdinalIgnoreCase)) is null)
+            if (!dashboardRunning
+                || !otlpEndpoints.Contains("grpc")
+                || _dashboard.OtlpEndpoints?.FirstOrDefault(e => e.Protocol.Contains("grpc", StringComparison.OrdinalIgnoreCase)) is null)
             {
                 table.UpdateCell(1, 1, defaultContent);
                 table.UpdateCell(1, 2, "");
@@ -516,7 +536,9 @@ public class RunCommand : AsyncCommand<RunCommand.Settings>
                 }
             }
 
-            if (!otlpEndpoints.Contains("http") || _dashboard.OtlpEndpoints?.FirstOrDefault(e => e.Protocol.Contains("http", StringComparison.OrdinalIgnoreCase)) is null)
+            if (!dashboardRunning
+                || !otlpEndpoints.Contains("http")
+                || _dashboard.OtlpEndpoints?.FirstOrDefault(e => e.Protocol.Contains("http", StringComparison.OrdinalIgnoreCase)) is null)
             {
                 table.UpdateCell(2, 1, defaultContent);
                 table.UpdateCell(2, 2, "");
@@ -532,7 +554,7 @@ public class RunCommand : AsyncCommand<RunCommand.Settings>
                 }
             }
 
-            if (dashboardOptions.Mcp.Disabled is true || _dashboard.McpEndpoint is null)
+            if (!dashboardRunning || dashboardOptions.Mcp.Disabled is true || _dashboard.McpEndpoint is null)
             {
                 table.UpdateCell(3, 1, defaultContent);
                 table.UpdateCell(3, 2, "");
@@ -958,10 +980,10 @@ public class RunCommand : AsyncCommand<RunCommand.Settings>
                 || text.StartsWith("debug", StringComparison.OrdinalIgnoreCase)
                 || text.StartsWith("trace", StringComparison.OrdinalIgnoreCase))
             {
-                return Widgets.PrimaryColorText;
+                return "white";
             }
 
-            return stream.Equals("stderr", StringComparison.OrdinalIgnoreCase) ? "red" : "grey";
+            return stream.Equals("stderr", StringComparison.OrdinalIgnoreCase) ? "red" : "white";
         }
 
         IRenderable BuildProcessPanel()
@@ -1334,6 +1356,150 @@ public class RunCommand : AsyncCommand<RunCommand.Settings>
             if (dashboardPid is int pid)
             {
                 TryTerminateProcessByPid(pid);
+            }
+        }
+
+        async Task KillAllManagedProcessesAsync()
+        {
+            var entries = _processManager.List();
+            var knownPids = entries
+                .SelectMany(entry => new[] { entry.Process.Pid, entry.LastKnownPid })
+                .Where(pid => pid is not null)
+                .Select(pid => pid!.Value)
+                .ToHashSet();
+
+            var knownPorts = entries
+                .SelectMany(entry => entry.ExposedPorts)
+                .Where(port => port is > ushort.MinValue and <= ushort.MaxValue)
+                .ToHashSet();
+
+            foreach (var dashboardPort in GetDashboardPorts())
+            {
+                knownPorts.Add(dashboardPort);
+            }
+
+            if (_dashboard?.Pid is int dashboardPid)
+            {
+                knownPids.Add(dashboardPid);
+            }
+
+            try
+            {
+                await _processManager.StopAllAsync(CancellationToken.None);
+                await _processManager.RemoveAllAsync(stopIfRunning: false, CancellationToken.None);
+            }
+            catch
+            {
+                // Continue force-kill path on failures.
+            }
+
+            foreach (var pid in knownPids)
+            {
+                TryTerminateProcessByPid(pid);
+            }
+
+            foreach (var ownerPid in GetListeningOwnerPidsByPorts(knownPorts))
+            {
+                TryTerminateProcessByPid(ownerPid);
+            }
+        }
+
+        static IReadOnlyCollection<int> GetListeningOwnerPidsByPorts(IReadOnlyCollection<int> ports)
+        {
+            if (ports.Count == 0 || !RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+            {
+                return [];
+            }
+
+            try
+            {
+                using var netstat = new Process
+                {
+                    StartInfo = new ProcessStartInfo
+                    {
+                        FileName = "netstat",
+                        Arguments = "-ano -p tcp",
+                        RedirectStandardOutput = true,
+                        RedirectStandardError = true,
+                        UseShellExecute = false,
+                        CreateNoWindow = true
+                    }
+                };
+
+                if (!netstat.Start())
+                {
+                    return [];
+                }
+
+                var output = netstat.StandardOutput.ReadToEnd();
+                netstat.WaitForExit(3000);
+
+                if (netstat.ExitCode != 0 || string.IsNullOrWhiteSpace(output))
+                {
+                    return [];
+                }
+
+                var expectedPorts = ports.ToHashSet();
+                var ownerPids = new HashSet<int>();
+                var lines = output.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries);
+
+                foreach (var rawLine in lines)
+                {
+                    var line = rawLine.Trim();
+                    if (!line.StartsWith("TCP", StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+
+                    var parts = line.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
+                    if (parts.Length < 5)
+                    {
+                        continue;
+                    }
+
+                    var localEndpoint = parts[1];
+                    var state = parts[3];
+                    var pidText = parts[4];
+
+                    if (!state.Equals("LISTENING", StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+
+                    var separatorIndex = localEndpoint.LastIndexOf(':');
+                    if (separatorIndex < 0)
+                    {
+                        continue;
+                    }
+
+                    if (!int.TryParse(localEndpoint[(separatorIndex + 1)..], out var localPort))
+                    {
+                        continue;
+                    }
+
+                    if (!expectedPorts.Contains(localPort))
+                    {
+                        continue;
+                    }
+
+                    if (!int.TryParse(pidText, out var ownerPid))
+                    {
+                        continue;
+                    }
+
+                    if (ownerPid <= 0 || ownerPid == Environment.ProcessId)
+                    {
+                        continue;
+                    }
+
+                    ownerPids.Add(ownerPid);
+                }
+
+                return [.. ownerPids];
+            }
+            catch
+            {
+                return [];
             }
         }
 

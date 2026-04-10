@@ -81,6 +81,7 @@ OPTIONS:
     - `S`: Stop selected managed process
     - `R`: Restart selected managed process
     - `D`: Delete selected managed process
+    - `K`: Kill runner session, terminate managed processes, and force-release known ports
     - `B`: Open the dashboard in the default browser
     - `H`: Open project documentation/help
     - `Esc` or `Ctrl+C`: Exit the runner
