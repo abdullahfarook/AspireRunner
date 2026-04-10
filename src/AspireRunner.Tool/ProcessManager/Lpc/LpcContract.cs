@@ -5,6 +5,7 @@ namespace AspireRunner.Tool.ProcessManager.Lpc;
 internal sealed record LpcRequest(
     [property: JsonPropertyName("command")] string Command,
     [property: JsonPropertyName("processId")] int? ProcessId = null,
+    [property: JsonPropertyName("port")] int? Port = null,
     [property: JsonPropertyName("name")] string? Name = null,
     [property: JsonPropertyName("exe")] string? Exe = null,
     [property: JsonPropertyName("args")] string? Args = null,
@@ -31,6 +32,7 @@ internal sealed record LpcProcessInfo(
     [property: JsonPropertyName("args")] string Args = "",
     [property: JsonPropertyName("workingDir")] string WorkingDir = "",
     [property: JsonPropertyName("running")] bool Running = false,
+    [property: JsonPropertyName("ports")] IReadOnlyList<int>? Ports = null,
     [property: JsonPropertyName("message")] string? Message = null);
 
 internal sealed record LpcListResponse(

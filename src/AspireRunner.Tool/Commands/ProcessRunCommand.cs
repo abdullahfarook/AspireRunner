@@ -4,6 +4,7 @@ using AspireRunner.Tool.ProcessManager;
 using AspireRunner.Tool.ProcessManager.Lpc;
 using Microsoft.Extensions.Logging;
 using System.ComponentModel;
+using System.Globalization;
 using System.Text;
 
 namespace AspireRunner.Tool.Commands;
@@ -35,6 +36,10 @@ public class ProcessRunCommand : AsyncCommand<ProcessRunCommand.Settings>
         [CommandOption("--env")]
         [Description("Environment variable in KEY=VALUE format. Pass multiple times to add more entries")]
         public string[] EnvironmentEntries { get; set; } = [];
+
+        [CommandOption("--port")]
+        [Description("Exposed port for the process. Pass multiple times for multiple ports")]
+        public int[] ExposedPorts { get; set; } = [];
 
         [CommandOption("--detach")]
         [Description("Start the process and return immediately")]
@@ -109,16 +114,18 @@ public class ProcessRunCommand : AsyncCommand<ProcessRunCommand.Settings>
         }
 
         var processCommand = BuildCommandPreview(settings.Executable, processOptions.Arguments);
+        var resolvedPorts = ResolveExposedPorts(processOptions.Arguments, settings.ExposedPorts);
         var processEntry = InMemoryProcessManager.Instance.Register(
             process,
             ProcessProfile.ExecutableProcess,
             command: processCommand,
-            details: BuildProcessDetails(process, processOptions),
+            details: BuildProcessDetails(process, processOptions, resolvedPorts),
             preferredId: settings.ProcessId,
             executable: settings.Executable,
             arguments: settings.Arguments ?? string.Empty,
             environmentVariables: BuildEnvironmentString(parseResult.EnvironmentVariables),
-            workingDirectory: processOptions.WorkingDirectory);
+            workingDirectory: processOptions.WorkingDirectory,
+            exposedPorts: resolvedPorts);
 
         Widgets.WriteInterpolated($"Started process [{Widgets.PrimaryColorText}]{process.DisplayName}[/] with PID [{Widgets.PrimaryColorText}]{process.Pid}[/] (id: [{Widgets.PrimaryColorText}]{processEntry.Id}[/])", true);
 
@@ -150,15 +157,20 @@ public class ProcessRunCommand : AsyncCommand<ProcessRunCommand.Settings>
         finally
         {
             Console.CancelKeyPress -= cancelHandler;
-            InMemoryProcessManager.Instance.UpdateMetadata(processEntry.Id, processCommand, BuildProcessDetails(process, processOptions));
+            InMemoryProcessManager.Instance.UpdateMetadata(processEntry.Id, processCommand, BuildProcessDetails(process, processOptions, resolvedPorts), exposedPorts: resolvedPorts);
         }
 
         return 0;
     }
 
-    private static string BuildProcessDetails(IManagedProcess process, ExecutableProcessOptions options)
+    private static string BuildProcessDetails(IManagedProcess process, ExecutableProcessOptions options, IReadOnlyList<int> ports)
     {
         var details = new List<string>();
+        if (ports.Count > 0)
+        {
+            details.Add($"port={string.Join('/', ports)}");
+        }
+
         if (!string.IsNullOrWhiteSpace(options.WorkingDirectory))
         {
             details.Add($"cwd={options.WorkingDirectory}");
@@ -171,6 +183,43 @@ public class ProcessRunCommand : AsyncCommand<ProcessRunCommand.Settings>
 
         details.Add(process.IsRunning ? "running" : "stopped");
         return string.Join(", ", details);
+    }
+
+    private static IReadOnlyList<int> ResolveExposedPorts(IReadOnlyList<string> arguments, IReadOnlyList<int> explicitPorts)
+    {
+        var ports = new HashSet<int>();
+
+        foreach (var port in explicitPorts)
+        {
+            if (port is > ushort.MinValue and <= ushort.MaxValue)
+            {
+                ports.Add(port);
+            }
+        }
+
+        for (var i = 0; i < arguments.Count; i++)
+        {
+            var arg = arguments[i];
+            if ((arg.Equals("--port", StringComparison.OrdinalIgnoreCase) || arg.Equals("-p", StringComparison.OrdinalIgnoreCase)) && i + 1 < arguments.Count)
+            {
+                if (int.TryParse(arguments[i + 1], NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsedPort)
+                    && parsedPort is > ushort.MinValue and <= ushort.MaxValue)
+                {
+                    ports.Add(parsedPort);
+                }
+
+                continue;
+            }
+
+            if (arg.StartsWith("--port=", StringComparison.OrdinalIgnoreCase)
+                && int.TryParse(arg[7..], NumberStyles.Integer, CultureInfo.InvariantCulture, out var inlinePort)
+                && inlinePort is > ushort.MinValue and <= ushort.MaxValue)
+            {
+                ports.Add(inlinePort);
+            }
+        }
+
+        return [.. ports.OrderBy(p => p)];
     }
 
     private static string BuildCommandPreview(string executable, IReadOnlyList<string> arguments)

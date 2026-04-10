@@ -1,0 +1,17 @@
+﻿﻿<Project Sdk="Microsoft.NET.Sdk">
+    <Sdk Name="Microsoft.Build.CentralPackageVersions" Version="2.1.3" />
+
+    <PropertyGroup>
+        <TargetFrameworks>netstandard2.0;</TargetFrameworks>
+        <LangVersion>latest</LangVersion>
+        <Nullable>enable</Nullable>
+        <PackageId>DoMin.ProcessManager.Client</PackageId>
+    </PropertyGroup>
+
+    <ItemGroup>
+      <PackageReference Include="DoMin.CSharpFunctionalExtensions"/>
+      <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" />
+      <PackageReference Include="System.Text.Json" />
+    </ItemGroup>
+
+</Project>

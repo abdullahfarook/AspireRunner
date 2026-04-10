@@ -74,6 +74,15 @@ OPTIONS:
         --verbose                         Enable verbose logging
 ```
 
+    While the dashboard runner is active, you can use the following keys in the interactive UI:
+
+    - `S`: Stop the dashboard
+    - `R`: Restart the dashboard
+    - `P`: Open the interactive process list and actions view (stop, restart, delete, logs)
+    - `B`: Open the dashboard in the default browser
+    - `H`: Open project documentation/help
+    - `Esc`: Exit the runner
+
 ### Install command
 
 ```bash
@@ -134,12 +143,28 @@ Lists managed processes in the current runner session inventory.
 If the local session inventory is empty, the command automatically attempts to attach to the active LPC host endpoint and renders that host inventory.
 
 ```bash
-aspire-dashboard process list [--running-only] [--auto-attach] [--lpc] [--lpc-port <port>]
+aspire-dashboard process list [--running-only] [--auto-attach] [--lpc] [--lpc-port <port>] [--interactive] [--select <id-or-name>] [--action <stop|restart|delete|logs>]
 ```
 
 - `--auto-attach` (default: true): if local inventory is empty, query LPC host list automatically
 - `--lpc`: always query the LPC host list directly
 - `--lpc-port`: override LPC port (default: `38472`)
+- `--interactive`: prompt for process selection and action after rendering the table
+- `--select`: choose a process by id, name, or PID
+- `--action`: run one action directly (`stop`, `restart`, `delete`, or `logs`)
+- Logs action options:
+    - `--logs-live` (default: true): stream live-only output
+    - `--logs-stdout` / `--logs-stderr` (default: true for both)
+    - `--logs-max-lines`: stop after N lines (0 = unlimited)
+    - `--logs-timeout-seconds`: stop after N seconds (0 = unlimited)
+
+### Process logs command
+
+Streams managed process logs from the active LPC host.
+
+```bash
+aspire-dashboard process logs <process-id> [--lpc-port <port>] [--live] [--stdout] [--stderr] [--max-lines <n>] [--timeout-seconds <n>]
+```
 
 ### Process stop command
 

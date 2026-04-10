@@ -4,6 +4,23 @@ using System.Text;
 
 Console.OutputEncoding = Encoding.UTF8;
 
+static void TryShowCursor()
+{
+    if (Console.IsOutputRedirected)
+    {
+        return;
+    }
+
+    try
+    {
+        AnsiConsole.Cursor.Show();
+    }
+    catch
+    {
+        // Ignore cursor visibility failures in non-interactive contexts.
+    }
+}
+
 var app = new CommandApp();
 app.Configure(config =>
 {
@@ -11,7 +28,7 @@ app.Configure(config =>
     config.SetApplicationVersion(RunnerInfo.Version.ToString());
     config.SetExceptionHandler((ex, _) =>
     {
-        AnsiConsole.Cursor.Show();
+        TryShowCursor();
         AnsiConsole.Write(Widgets.Error(ex.Message));
 
 #if DEBUG
@@ -37,6 +54,8 @@ app.Configure(config =>
             .WithDescription("Run and manage a generic executable process");
         process.AddCommand<ProcessListCommand>("list")
             .WithDescription("List managed processes in the current session inventory");
+        process.AddCommand<ProcessLogsCommand>("logs")
+            .WithDescription("Stream logs for a managed process by PID");
         process.AddCommand<ProcessStopCommand>("stop")
             .WithDescription("Stop a managed process by id");
         process.AddCommand<ProcessRestartCommand>("restart")
@@ -48,5 +67,5 @@ app.Configure(config =>
 });
 
 var exitCode = await app.RunAsync(args);
-AnsiConsole.Cursor.Show();
+TryShowCursor();
 return exitCode;

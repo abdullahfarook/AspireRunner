@@ -4,8 +4,8 @@ param(
     [switch]$RunAllAndShowList,
     [int]$DashboardPort = 19088,
     [int]$LpcPort = 38472,
-    [int]$NodePort = 3000,
-    [int]$CSharpPort = 5000
+    [int]$NodePort = 39000,
+    [int]$CSharpPort = 39001
 )
 
 Set-StrictMode -Version Latest
@@ -14,7 +14,8 @@ $ErrorActionPreference = "Stop"
 $testsDir = Split-Path -Parent $PSCommandPath
 $repoRoot = (Resolve-Path (Join-Path $testsDir "..")).Path
 $statePath = Join-Path $testsDir ".processmanager.state.json"
-$toolOutputDir = Join-Path $repoRoot ".tmp-build/tool-net8-tests"
+$buildStamp = [DateTime]::UtcNow.ToString("yyyyMMddHHmmss")
+$toolOutputDir = Join-Path $repoRoot ".tmp-build/tool-net8-tests-$buildStamp"
 $toolDll = Join-Path $toolOutputDir "AspireRunner.Tool.dll"
 $toolExe = Join-Path $toolOutputDir "AspireRunner.Tool.exe"
 
@@ -70,14 +71,10 @@ function Wait-PortState {
 }
 
 function Ensure-ToolBuild {
-    if (Test-Path $toolDll) {
-        return
-    }
-
     Write-Step "Building AspireRunner.Tool for the test harness"
     Push-Location $repoRoot
     try {
-        dotnet build src/AspireRunner.Tool/AspireRunner.Tool.csproj -c Debug -f net8.0 -o .tmp-build/tool-net8-tests
+        dotnet build src/AspireRunner.Tool/AspireRunner.Tool.csproj -c Debug -f net8.0 -o $toolOutputDir
         if ($LASTEXITCODE -ne 0) {
             throw "dotnet build failed with exit code $LASTEXITCODE"
         }
@@ -238,7 +235,7 @@ function Resolve-PortFromProcess {
         return $DashboardPort
     }
 
-    $signature = "$($ProcessInfo.name) $($ProcessInfo.exe) $($ProcessInfo.args)"
+    $signature = "$($ProcessInfo.name) $($ProcessInfo.exe) $($ProcessInfo.'args')"
 
     if ($signature -match "app\\.js") {
         return $NodePort
@@ -268,7 +265,7 @@ function Show-InventoryTable {
             Running = $process.running
             Port = Resolve-PortFromProcess -ProcessInfo $process
             Exe = $process.exe
-            Args = $process.args
+            Arguments = $process.'args'
         }
     }
 
@@ -289,16 +286,57 @@ function Invoke-ToolProcessList {
         $arguments += @("--lpc", "--lpc-port", $LpcPort)
     }
 
+    Invoke-ToolCommand -Arguments $arguments | Out-Null
+}
+
+function Invoke-ToolCommand {
+    param([string[]]$Arguments)
+
     if (Test-Path $toolExe) {
-        & $toolExe @arguments
+        $output = & $toolExe @Arguments 2>&1
     }
     else {
-        & dotnet $toolDll @arguments
+        $output = & dotnet $toolDll @Arguments 2>&1
     }
 
     if ($LASTEXITCODE -ne 0) {
-        throw "AspireRunner.Tool process list failed with exit code $LASTEXITCODE"
+        throw "AspireRunner.Tool command failed with exit code $LASTEXITCODE. Args: $($Arguments -join ' ')"
     }
+
+    return @($output)
+}
+
+function Invoke-ToolProcessAction {
+    param(
+        [string]$Select,
+        [ValidateSet("stop", "restart", "delete", "logs")]
+        [string]$Action,
+        [int]$LogsMaxLines = 0,
+        [int]$LogsTimeoutSeconds = 0
+    )
+
+    $arguments = @(
+        "process",
+        "list",
+        "--lpc",
+        "--lpc-port", $LpcPort,
+        "--select", $Select,
+        "--action", $Action
+    )
+
+    if ($Action -eq "logs") {
+        $arguments += @("--logs-live", "--logs-stdout", "--logs-stderr")
+
+        if ($LogsMaxLines -gt 0) {
+            $arguments += @("--logs-max-lines", $LogsMaxLines)
+        }
+
+        if ($LogsTimeoutSeconds -gt 0) {
+            $arguments += @("--logs-timeout-seconds", $LogsTimeoutSeconds)
+        }
+    }
+
+    return Invoke-ToolCommand -Arguments $arguments
 }
 
 function Get-ProcessByName {
@@ -314,7 +352,8 @@ function Ensure-RegisteredProcess {
         [string]$Exe,
         [string]$ArgumentText,
         [int]$ExpectedPort,
-        [string]$WorkingDir
+        [string]$WorkingDir,
+        [string]$EnvironmentText = ""
     )
 
     $existing = Get-ProcessByName -Name $Name
@@ -330,13 +369,17 @@ function Ensure-RegisteredProcess {
     }
 
     Write-Step "Registering managed process: $Name"
-    $registerResponse = Invoke-LpcRequest -Request @{
+    $registerRequest = @{
         command = "Register"
         name = $Name
         exe = $Exe
-        args = $ArgumentText
+        port = $ExpectedPort
+        envs = $EnvironmentText
         workingDir = $WorkingDir
     }
+
+    $registerRequest["args"] = $ArgumentText
+    $registerResponse = Invoke-LpcRequest -Request $registerRequest
 
     Assert-True -Condition $registerResponse.ok -Message "Register command succeeded for $Name"
     Assert-True -Condition (Wait-PortState -Port $ExpectedPort -ShouldBeListening $true -TimeoutSeconds 40) -Message "$Name is listening on port $ExpectedPort"
@@ -407,8 +450,8 @@ $nodeScriptPath = Join-Path $testsDir "app.js"
 $csharpScriptPath = Join-Path $testsDir "app.cs"
 $csharpProjectPath = Join-Path $testsDir "app.csproj"
 
-$nodePid = Ensure-RegisteredProcess -Name "NodeExpressTestApp" -Exe "node" -ArgumentText ('"' + $nodeScriptPath + '"') -ExpectedPort $NodePort -WorkingDir $testsDir
-$csharpPid = Ensure-RegisteredProcess -Name "CSharpSingleFileTestApp" -Exe "dotnet" -ArgumentText ('run --project "' + $csharpProjectPath + '"') -ExpectedPort $CSharpPort -WorkingDir $repoRoot
+$nodePid = Ensure-RegisteredProcess -Name "NodeExpressTestApp" -Exe "node" -ArgumentText ('"' + $nodeScriptPath + '"') -ExpectedPort $NodePort -WorkingDir $testsDir -EnvironmentText ("PORT={0}" -f $NodePort)
+$csharpPid = Ensure-RegisteredProcess -Name "CSharpSingleFileTestApp" -Exe "dotnet" -ArgumentText ('run --project "' + $csharpProjectPath + '"') -ExpectedPort $CSharpPort -WorkingDir $repoRoot -EnvironmentText ("PORT={0}" -f $CSharpPort)
 
 Assert-True -Condition (Wait-PortState -Port $DashboardPort -ShouldBeListening $true -TimeoutSeconds 10) -Message "Dashboard port $DashboardPort is open"
 Assert-True -Condition (Wait-PortState -Port $NodePort -ShouldBeListening $true -TimeoutSeconds 10) -Message "Node app port $NodePort is open"
@@ -435,25 +478,26 @@ if ($RunAllAndShowList) {
 Write-Step "Rendering single inventory table for dashboard and managed apps"
 Show-InventoryTable
 
-Write-Step "Validating logs view via LPC stdout/stderr streaming"
-$stdoutLines = Invoke-LpcRequest -Request @{ command = "StdoutLiveOnly"; processId = $nodePid } -AsStream -MaxLines 3 -TimeoutSeconds 10
-$stderrLines = Invoke-LpcRequest -Request @{ command = "StderrLiveOnly"; processId = $nodePid } -AsStream -MaxLines 2 -TimeoutSeconds 10
+Write-Step "Validating tool-native realtime logs action"
+$logsOutput = Invoke-ToolProcessAction -Select "NodeExpressTestApp" -Action "logs" -LogsMaxLines 6 -LogsTimeoutSeconds 12
+Assert-True -Condition ($logsOutput.Count -gt 0) -Message "Tool-native logs action returns output lines"
 
-Assert-True -Condition ($stdoutLines.Count -gt 0) -Message "Stdout stream returns log lines"
-Assert-True -Condition ($stderrLines.Count -gt 0) -Message "Stderr stream returns log lines"
+$stdoutLines = @($logsOutput | Where-Object { $_ -match "\[stdout\]" })
+$stderrLines = @($logsOutput | Where-Object { $_ -match "\[stderr\]" })
 
-Write-Host "Recent stdout lines:" -ForegroundColor Yellow
-$stdoutLines | ForEach-Object { Write-Host "  $_" }
-Write-Host "Recent stderr lines:" -ForegroundColor Yellow
-$stderrLines | ForEach-Object { Write-Host "  $_" }
+Assert-True -Condition ($stdoutLines.Count -gt 0) -Message "Tool-native logs include stdout lines"
+Assert-True -Condition ($stderrLines.Count -gt 0) -Message "Tool-native logs include stderr lines"
+
+Write-Host "Recent tool-native stdout lines:" -ForegroundColor Yellow
+$stdoutLines | Select-Object -First 3 | ForEach-Object { Write-Host "  $_" }
+Write-Host "Recent tool-native stderr lines:" -ForegroundColor Yellow
+$stderrLines | Select-Object -First 3 | ForEach-Object { Write-Host "  $_" }
 
 Write-Step "Validating stop + restart on C# app"
-$stopResponse = Invoke-LpcRequest -Request @{ command = "Stop"; processId = $csharpPid }
-Assert-True -Condition $stopResponse.ok -Message "Stop command acknowledged"
+Invoke-ToolProcessAction -Select "CSharpSingleFileTestApp" -Action "stop" | Out-Null
 Assert-True -Condition (Wait-PortState -Port $CSharpPort -ShouldBeListening $false -TimeoutSeconds 30) -Message "C# app port $CSharpPort is released after stop"
 
-$restartResponse = Invoke-LpcRequest -Request @{ command = "Restart"; processId = $csharpPid }
-Assert-True -Condition $restartResponse.ok -Message "Restart command acknowledged"
+Invoke-ToolProcessAction -Select "CSharpSingleFileTestApp" -Action "restart" | Out-Null
 Assert-True -Condition (Wait-PortState -Port $CSharpPort -ShouldBeListening $true -TimeoutSeconds 40) -Message "C# app port $CSharpPort is listening after restart"
 
 $updatedCSharp = Get-ProcessByName -Name "CSharpSingleFileTestApp"
@@ -461,14 +505,13 @@ Assert-True -Condition ($null -ne $updatedCSharp -and $updatedCSharp.running) -M
 $csharpPid = [int]$updatedCSharp.processId
 
 Write-Step "Validating delete operation and port release on Node app"
-$deleteResponse = Invoke-LpcRequest -Request @{ command = "Delete"; processId = $nodePid }
-Assert-True -Condition $deleteResponse.ok -Message "Delete command acknowledged"
+Invoke-ToolProcessAction -Select "NodeExpressTestApp" -Action "delete" | Out-Null
 Assert-True -Condition (Wait-PortState -Port $NodePort -ShouldBeListening $false -TimeoutSeconds 30) -Message "Node app port $NodePort is released after delete"
 
 $nodeAfterDelete = Get-ProcessByName -Name "NodeExpressTestApp"
 Assert-True -Condition ($null -eq $nodeAfterDelete) -Message "Node app entry removed from manager inventory"
 
-$nodePid = Ensure-RegisteredProcess -Name "NodeExpressTestApp" -Exe "node" -ArgumentText ('"' + $nodeScriptPath + '"') -ExpectedPort $NodePort -WorkingDir $testsDir
+$nodePid = Ensure-RegisteredProcess -Name "NodeExpressTestApp" -Exe "node" -ArgumentText ('"' + $nodeScriptPath + '"') -ExpectedPort $NodePort -WorkingDir $testsDir -EnvironmentText ("PORT={0}" -f $NodePort)
 
 Write-Step "Inventory after stop/restart/delete coverage"
 Show-InventoryTable

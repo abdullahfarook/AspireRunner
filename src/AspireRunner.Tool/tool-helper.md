@@ -32,7 +32,7 @@ External dependencies:
   - UninstallCommand: remove dashboard versions
   - CleanupCommand: remove old installs and stale instance state
   - ProcessRunCommand: starts and manages a generic executable process
-  - ProcessListCommand / ProcessStopCommand / ProcessRestartCommand / ProcessRemoveCommand: session inventory operations for managed processes
+  - ProcessListCommand / ProcessLogsCommand / ProcessStopCommand / ProcessRestartCommand / ProcessRemoveCommand: session inventory operations for managed processes
 - ProcessManager/
   - InMemoryProcessManager: session-scoped process registry for both Aspire and generic process profiles
   - ManagedProcessEntry: tracked process metadata

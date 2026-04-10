@@ -1,0 +1,10 @@
+{
+  "name": "process-manager-node-logger",
+  "version": "1.0.0",
+  "description": "Node.js loop that outputs logs and errors to console",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "run": "node index.js"
+  }
+}

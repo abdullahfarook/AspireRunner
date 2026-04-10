@@ -5,6 +5,7 @@ using System.Net;
 using System.Net.Sockets;
 using System.Text;
 using System.Text.Json;
+using System.Globalization;
 
 namespace AspireRunner.Tool.ProcessManager.Lpc;
 
@@ -289,6 +290,7 @@ internal sealed class LpcServer : IDisposable
 
         var environmentVariables = ParseEnvironmentVariables(request.Envs);
         var parsedArguments = ParseArguments(request.Args);
+        var inferredPorts = InferPorts(parsedArguments, request.Envs, request.Port);
         var processOptions = new ExecutableProcessOptions
         {
             ExecutablePath = request.Exe,
@@ -325,11 +327,12 @@ internal sealed class LpcServer : IDisposable
             managedProcess,
             ProcessProfile.ExecutableProcess,
             command: BuildCommandPreview(request.Exe, parsedArguments),
-            details: BuildDetails(processOptions, managedProcess),
+            details: BuildDetails(processOptions, managedProcess, inferredPorts),
             executable: request.Exe,
             arguments: argsText,
             environmentVariables: request.Envs,
-            workingDirectory: request.WorkingDir);
+            workingDirectory: request.WorkingDir,
+            exposedPorts: inferredPorts);
 
         await WriteResponseAsync(
                 writer,
@@ -339,7 +342,6 @@ internal sealed class LpcServer : IDisposable
 
     private async Task HandleStopAsync(LpcRequest request, StreamWriter writer, CancellationToken cancellationToken)
     {
-        _ = cancellationToken;
         if (request.ProcessId is null)
         {
             await WriteResponseAsync(writer, LpcResponse.Fail("processId is required")).ConfigureAwait(false);
@@ -352,13 +354,18 @@ internal sealed class LpcServer : IDisposable
             return;
         }
 
+        var stopped = await _manager.StopAsync(entry.Id, cancellationToken).ConfigureAwait(false);
+        if (!stopped)
+        {
+            await WriteResponseAsync(writer, LpcResponse.Fail("Failed to stop process")).ConfigureAwait(false);
+            return;
+        }
+
         await WriteResponseAsync(writer, new LpcResponse(Ok: true, ProcessId: entry.LastKnownPid ?? request.ProcessId)).ConfigureAwait(false);
-        _ = Task.Run(async () => await _manager.StopAsync(entry.Id, CancellationToken.None).ConfigureAwait(false));
     }
 
     private async Task HandleRestartAsync(LpcRequest request, StreamWriter writer, CancellationToken cancellationToken)
     {
-        _ = cancellationToken;
         if (request.ProcessId is null)
         {
             await WriteResponseAsync(writer, LpcResponse.Fail("processId is required")).ConfigureAwait(false);
@@ -371,8 +378,14 @@ internal sealed class LpcServer : IDisposable
             return;
         }
 
+        var restarted = await _manager.RestartAsync(entry.Id, cancellationToken).ConfigureAwait(false);
+        if (!restarted)
+        {
+            await WriteResponseAsync(writer, LpcResponse.Fail("Failed to restart process")).ConfigureAwait(false);
+            return;
+        }
+
         await WriteResponseAsync(writer, new LpcResponse(Ok: true, ProcessId: entry.LastKnownPid ?? request.ProcessId)).ConfigureAwait(false);
-        _ = Task.Run(async () => await _manager.RestartAsync(entry.Id, CancellationToken.None).ConfigureAwait(false));
     }
 
     private async Task HandleRemoveAsync(LpcRequest request, StreamWriter writer)
@@ -389,31 +402,34 @@ internal sealed class LpcServer : IDisposable
             return;
         }
 
+        var removed = await _manager.RemoveAsync(entry.Id, stopIfRunning: !request.KeepRunning, CancellationToken.None).ConfigureAwait(false);
+        if (!removed)
+        {
+            await WriteResponseAsync(writer, LpcResponse.Fail("Failed to remove process")).ConfigureAwait(false);
+            return;
+        }
+
         await WriteResponseAsync(writer, new LpcResponse(Ok: true, ProcessId: entry.LastKnownPid ?? request.ProcessId)).ConfigureAwait(false);
-        _ = Task.Run(async () => await _manager.RemoveAsync(entry.Id, stopIfRunning: !request.KeepRunning, CancellationToken.None).ConfigureAwait(false));
     }
 
     private async Task HandleShutdownAsync(StreamWriter writer)
     {
-        await WriteResponseAsync(writer, new LpcResponse(Ok: true, Port: Port)).ConfigureAwait(false);
-
-        _ = Task.Run(async () =>
+        try
         {
-            try
-            {
-                await _manager.StopAllAsync(CancellationToken.None).ConfigureAwait(false);
-                await _manager.RemoveAllAsync(stopIfRunning: false, CancellationToken.None).ConfigureAwait(false);
+            await _manager.StopAllAsync(CancellationToken.None).ConfigureAwait(false);
+            await _manager.RemoveAllAsync(stopIfRunning: false, CancellationToken.None).ConfigureAwait(false);
+            await WriteResponseAsync(writer, new LpcResponse(Ok: true, Port: Port)).ConfigureAwait(false);
 
-                if (_shutdownRequested is not null)
-                {
-                    await _shutdownRequested().ConfigureAwait(false);
-                }
-            }
-            catch (Exception ex)
+            if (_shutdownRequested is not null)
             {
-                _logger.LogError(ex, "Failed to shutdown managed processes through LPC shutdown command");
+                await _shutdownRequested().ConfigureAwait(false);
             }
-        });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to shutdown managed processes through LPC shutdown command");
+            await WriteResponseAsync(writer, LpcResponse.Fail("Failed to shutdown host")).ConfigureAwait(false);
+        }
     }
 
     private async Task HandleListAsync(StreamWriter writer)
@@ -428,6 +444,7 @@ internal sealed class LpcServer : IDisposable
                 Args: e.Arguments ?? string.Empty,
                 WorkingDir: e.WorkingDirectory ?? string.Empty,
                 Running: e.Process.IsRunning,
+                Ports: e.ExposedPorts,
                 Message: e.Details))
             .ToList();
 
@@ -519,9 +536,14 @@ internal sealed class LpcServer : IDisposable
         return $"{executable} {string.Join(' ', arguments)}";
     }
 
-    private static string BuildDetails(ExecutableProcessOptions options, IManagedProcess process)
+    private static string BuildDetails(ExecutableProcessOptions options, IManagedProcess process, IReadOnlyList<int> ports)
     {
         var details = new List<string>();
+        if (ports.Count > 0)
+        {
+            details.Add($"port={string.Join('/', ports)}");
+        }
+
         if (!string.IsNullOrWhiteSpace(options.WorkingDirectory))
         {
             details.Add($"cwd={options.WorkingDirectory}");
@@ -534,6 +556,63 @@ internal sealed class LpcServer : IDisposable
 
         details.Add(process.IsRunning ? "running" : "stopped");
         return string.Join(", ", details);
+    }
+
+    private static IReadOnlyList<int> InferPorts(IReadOnlyList<string> args, string? envs, int? explicitPort)
+    {
+        var ports = new HashSet<int>();
+
+        if (explicitPort is > ushort.MinValue and <= ushort.MaxValue)
+        {
+            ports.Add(explicitPort.Value);
+        }
+
+        for (var i = 0; i < args.Count; i++)
+        {
+            var arg = args[i];
+            if ((arg.Equals("--port", StringComparison.OrdinalIgnoreCase) || arg.Equals("-p", StringComparison.OrdinalIgnoreCase)) && i + 1 < args.Count)
+            {
+                if (int.TryParse(args[i + 1], NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsedPort)
+                    && parsedPort is > ushort.MinValue and <= ushort.MaxValue)
+                {
+                    ports.Add(parsedPort);
+                }
+
+                continue;
+            }
+
+            if (arg.StartsWith("--port=", StringComparison.OrdinalIgnoreCase)
+                && int.TryParse(arg[7..], NumberStyles.Integer, CultureInfo.InvariantCulture, out var inlinePort)
+                && inlinePort is > ushort.MinValue and <= ushort.MaxValue)
+            {
+                ports.Add(inlinePort);
+                continue;
+            }
+
+            if (Uri.TryCreate(arg, UriKind.Absolute, out var uri) && uri.Port is > ushort.MinValue and <= ushort.MaxValue)
+            {
+                ports.Add(uri.Port);
+            }
+        }
+
+        if (!string.IsNullOrWhiteSpace(envs))
+        {
+            foreach (var pair in envs.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            {
+                if (!pair.StartsWith("PORT=", StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                if (int.TryParse(pair[5..], NumberStyles.Integer, CultureInfo.InvariantCulture, out var envPort)
+                    && envPort is > ushort.MinValue and <= ushort.MaxValue)
+                {
+                    ports.Add(envPort);
+                }
+            }
+        }
+
+        return [.. ports.OrderBy(p => p)];
     }
 
     public void Dispose()

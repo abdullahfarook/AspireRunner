@@ -2,9 +2,12 @@ using System.Net;
 using System.Net.Sockets;
 using System.Text;
 
-const int Port = 5000;
+var configuredPort = Environment.GetEnvironmentVariable("PORT");
+var port = int.TryParse(configuredPort, out var parsedPort) && parsedPort is > 0 and <= 65535
+    ? parsedPort
+    : 5000;
 using var shutdownCts = new CancellationTokenSource();
-using var listener = new TcpListener(IPAddress.Loopback, Port);
+using var listener = new TcpListener(IPAddress.Loopback, port);
 
 Console.CancelKeyPress += (_, e) =>
 {
@@ -13,7 +16,7 @@ Console.CancelKeyPress += (_, e) =>
 };
 
 listener.Start();
-Console.WriteLine($"C# single-file app listening on http://127.0.0.1:{Port}");
+Console.WriteLine($"C# single-file app listening on http://127.0.0.1:{port}");
 
 var heartbeatTask = Task.Run(async () =>
 {
@@ -44,7 +47,7 @@ try
     while (!shutdownCts.IsCancellationRequested)
     {
         var client = await listener.AcceptTcpClientAsync(shutdownCts.Token);
-        _ = Task.Run(() => HandleClientAsync(client, shutdownCts.Token), shutdownCts.Token);
+        _ = Task.Run(() => HandleClientAsync(client, shutdownCts.Token, port), shutdownCts.Token);
     }
 }
 catch (OperationCanceledException)
@@ -68,7 +71,7 @@ finally
     Console.WriteLine("C# single-file app stopped");
 }
 
-static async Task HandleClientAsync(TcpClient client, CancellationToken cancellationToken)
+static async Task HandleClientAsync(TcpClient client, CancellationToken cancellationToken, int port)
 {
     using (client)
     {
@@ -91,7 +94,7 @@ static async Task HandleClientAsync(TcpClient client, CancellationToken cancella
             // Read and discard headers.
         }
 
-        var responseBody = $"{{\"service\":\"csharp-single-file-test-app\",\"status\":\"ok\",\"port\":{Port},\"time\":\"{DateTimeOffset.UtcNow:o}\"}}";
+        var responseBody = $"{{\"service\":\"csharp-single-file-test-app\",\"status\":\"ok\",\"port\":{port},\"time\":\"{DateTimeOffset.UtcNow:o}\"}}";
         var responseBytes = Encoding.UTF8.GetBytes(responseBody);
 
         await writer.WriteLineAsync("HTTP/1.1 200 OK");

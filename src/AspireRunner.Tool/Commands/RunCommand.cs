@@ -225,6 +225,7 @@ public class RunCommand : AsyncCommand<RunCommand.Settings>
         var actions = new Columns(
             Widgets.KeyActionDescriptor("S", "Stop"),
             Widgets.KeyActionDescriptor("R", "Restart"),
+            Widgets.KeyActionDescriptor("P", "Processes"),
             Widgets.KeyActionDescriptor("B", "Open browser"),
             Widgets.KeyActionDescriptor("H", "Help"),
             Widgets.KeyActionDescriptor("Esc", "Exit")
@@ -309,6 +310,11 @@ public class RunCommand : AsyncCommand<RunCommand.Settings>
                     case ConsoleKey.S:
                     {
                         await StopDashboardAsync();
+                        break;
+                    }
+                    case ConsoleKey.P:
+                    {
+                        await ShowProcessDashboardAsync();
                         break;
                     }
                 }
@@ -545,6 +551,7 @@ public class RunCommand : AsyncCommand<RunCommand.Settings>
             var dashboardEnvironment = dashboardOptions.ToEnvironmentVariables();
             var command = $"{RunnerInfo.CommandName} aspire run {settings.Version}".TrimEnd();
             var details = BuildDashboardDetails();
+            var dashboardPorts = GetDashboardPorts();
 
             if (string.IsNullOrWhiteSpace(_dashboardProcessId))
             {
@@ -557,7 +564,8 @@ public class RunCommand : AsyncCommand<RunCommand.Settings>
                     executable: dashboardExe,
                     arguments: dashboardArgs,
                     environmentVariables: BuildEnvironmentString(dashboardEnvironment),
-                    workingDirectory: _dashboard.InstallationPath);
+                    workingDirectory: _dashboard.InstallationPath,
+                    exposedPorts: dashboardPorts);
                 _dashboardProcessId = processEntry.Id;
                 return;
             }
@@ -569,7 +577,8 @@ public class RunCommand : AsyncCommand<RunCommand.Settings>
                 executable: dashboardExe,
                 arguments: dashboardArgs,
                 environmentVariables: BuildEnvironmentString(dashboardEnvironment),
-                workingDirectory: _dashboard.InstallationPath);
+                workingDirectory: _dashboard.InstallationPath,
+                exposedPorts: dashboardPorts);
         }
 
         Table BuildInventoryTable()
@@ -667,6 +676,33 @@ public class RunCommand : AsyncCommand<RunCommand.Settings>
             return string.Join(", ", details);
         }
 
+        IReadOnlyList<int> GetDashboardPorts()
+        {
+            var ports = new HashSet<int>
+            {
+                settings.DashboardPort
+            };
+
+            if (otlpEndpoints.Contains("grpc"))
+            {
+                ports.Add(settings.OtlpPort);
+            }
+
+            if (otlpEndpoints.Contains("http"))
+            {
+                ports.Add(settings.OtlpHttpPort ?? OtlpOptions.DefaultOtlpHttpPort);
+            }
+
+            if (dashboardOptions.Mcp.Disabled is false)
+            {
+                ports.Add(settings.McpPort);
+            }
+
+            return [.. ports
+                .Where(p => p is > ushort.MinValue and <= ushort.MaxValue)
+                .OrderBy(p => p)];
+        }
+
         string? BuildEnvironmentString(IReadOnlyDictionary<string, string?> environmentVariables)
         {
             if (environmentVariables.Count == 0)
@@ -705,6 +741,29 @@ public class RunCommand : AsyncCommand<RunCommand.Settings>
             {
                 TryTerminateProcessByPid(pid);
             }
+        }
+
+        async Task ShowProcessDashboardAsync()
+        {
+            var listSettings = new ProcessListCommand.Settings
+            {
+                AutoAttach = true,
+                UseLpc = lpcServer is not null,
+                LpcPort = lpcServer?.Port ?? LpcServer.DefaultPort,
+                Interactive = true
+            };
+
+            AnsiConsole.Clear();
+
+            var listCommand = new ProcessListCommand();
+            await listCommand.ExecutePublicAsync(null!, listSettings, sessionToken).ConfigureAwait(false);
+
+            SyncDashboardInventory();
+            UpdateTableCells(defaultStatus);
+            UpdateInventoryPanel();
+
+            mainLayout["prompt"].Update(new Align(actions, HorizontalAlignment.Left, VerticalAlignment.Bottom));
+            mainLayout.Render();
         }
 
         static void TryTerminateProcessByPid(int pid)

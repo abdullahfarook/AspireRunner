@@ -23,6 +23,8 @@ public sealed class ManagedProcessEntry
 
     public string? WorkingDirectory { get; set; }
 
+    public IReadOnlyList<int> ExposedPorts { get; set; } = [];
+
     public int? LastKnownPid { get; set; }
 
     public DateTimeOffset CreatedAt { get; init; } = DateTimeOffset.UtcNow;

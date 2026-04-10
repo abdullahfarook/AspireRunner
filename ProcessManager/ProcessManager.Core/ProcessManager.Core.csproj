@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk">
+    <Sdk Name="Microsoft.Build.CentralPackageVersions" Version="2.1.3" />
+
+    <PropertyGroup>
+        <TargetFrameworks>net8.0;</TargetFrameworks>
+        <Nullable>enable</Nullable>
+        <ImplicitUsings>enable</ImplicitUsings>
+        <LangVersion>latest</LangVersion>
+    </PropertyGroup>
+</Project>

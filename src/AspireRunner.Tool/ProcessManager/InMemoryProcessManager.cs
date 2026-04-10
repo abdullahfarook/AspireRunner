@@ -4,6 +4,7 @@ using System.Collections.Concurrent;
 using System.Globalization;
 using System.Diagnostics;
 using System.Threading;
+using System.Net.NetworkInformation;
 
 namespace AspireRunner.Tool.ProcessManager;
 
@@ -25,7 +26,8 @@ public sealed class InMemoryProcessManager
         string? executable = null,
         string? arguments = null,
         string? environmentVariables = null,
-        string? workingDirectory = null)
+        string? workingDirectory = null,
+        IReadOnlyList<int>? exposedPorts = null)
     {
         ArgumentNullException.ThrowIfNull(process);
 
@@ -43,6 +45,7 @@ public sealed class InMemoryProcessManager
             Arguments = arguments,
             EnvironmentVariables = environmentVariables,
             WorkingDirectory = workingDirectory,
+            ExposedPorts = NormalizePorts(exposedPorts),
             LastKnownPid = process.Pid,
             CreatedAt = now,
             LastUpdatedAt = now
@@ -102,7 +105,8 @@ public sealed class InMemoryProcessManager
         string? executable = null,
         string? arguments = null,
         string? environmentVariables = null,
-        string? workingDirectory = null)
+        string? workingDirectory = null,
+        IReadOnlyList<int>? exposedPorts = null)
     {
         if (!TryGet(id, out var entry) || entry is null)
         {
@@ -139,6 +143,11 @@ public sealed class InMemoryProcessManager
             entry.WorkingDirectory = workingDirectory;
         }
 
+        if (exposedPorts is not null)
+        {
+            entry.ExposedPorts = NormalizePorts(exposedPorts);
+        }
+
         UpdateProcessState(entry);
         entry.LastUpdatedAt = DateTimeOffset.UtcNow;
     }
@@ -158,6 +167,7 @@ public sealed class InMemoryProcessManager
         }
 
         var pid = entry.Process.Pid ?? entry.LastKnownPid;
+        var ports = entry.ExposedPorts;
 
         try
         {
@@ -173,6 +183,9 @@ public sealed class InMemoryProcessManager
             TryKillByPid(pid);
         }
 
+        await WaitForProcessExitAsync(pid, cancellationToken).ConfigureAwait(false);
+        await WaitForPortsReleasedAsync(ports, cancellationToken).ConfigureAwait(false);
+
         UpdateProcessState(entry);
         entry.LastUpdatedAt = DateTimeOffset.UtcNow;
         return true;
@@ -187,7 +200,7 @@ public sealed class InMemoryProcessManager
 
         if (entry.Process.IsRunning)
         {
-            await entry.Process.StopAsync(cancellationToken);
+            await StopAsync(id, cancellationToken).ConfigureAwait(false);
         }
 
         await entry.Process.StartAsync(cancellationToken);
@@ -313,10 +326,76 @@ public sealed class InMemoryProcessManager
         {
             var process = Process.GetProcessById(pid.Value);
             process.Kill(entireProcessTree: true);
+            process.WaitForExit(5000);
         }
         catch
         {
             // Best-effort fallback when graceful stop does not terminate the process.
+        }
+    }
+
+    private static IReadOnlyList<int> NormalizePorts(IReadOnlyList<int>? ports)
+    {
+        if (ports is null || ports.Count == 0)
+        {
+            return [];
+        }
+
+        return [.. ports
+            .Where(p => p is > ushort.MinValue and <= ushort.MaxValue)
+            .Distinct()
+            .OrderBy(p => p)];
+    }
+
+    private static async Task WaitForProcessExitAsync(int? pid, CancellationToken cancellationToken)
+    {
+        if (pid is null)
+        {
+            return;
+        }
+
+        var deadline = DateTimeOffset.UtcNow.AddSeconds(8);
+        while (DateTimeOffset.UtcNow < deadline)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            try
+            {
+                var process = Process.GetProcessById(pid.Value);
+                if (process.HasExited)
+                {
+                    return;
+                }
+            }
+            catch
+            {
+                return;
+            }
+
+            await Task.Delay(200, cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    private static async Task WaitForPortsReleasedAsync(IReadOnlyList<int> ports, CancellationToken cancellationToken)
+    {
+        if (ports.Count == 0)
+        {
+            return;
+        }
+
+        var deadline = DateTimeOffset.UtcNow.AddSeconds(15);
+        while (DateTimeOffset.UtcNow < deadline)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            var listeners = IPGlobalProperties.GetIPGlobalProperties().GetActiveTcpListeners();
+            var allReleased = ports.All(port => listeners.All(listener => listener.Port != port));
+            if (allReleased)
+            {
+                return;
+            }
+
+            await Task.Delay(250, cancellationToken).ConfigureAwait(false);
         }
     }
 }
