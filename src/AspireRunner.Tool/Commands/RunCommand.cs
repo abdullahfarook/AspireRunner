@@ -360,13 +360,28 @@ public class RunCommand : AsyncCommand<RunCommand.Settings>
                         UpdateInventoryPanel();
                         ctx.Refresh();
 
-                        if (_dashboard.Url != null && _dashboard.OtlpEndpoints?.Count == otlpEndpoints.Count && (dashboardOptions.Mcp.Disabled is true || _dashboard.McpEndpoint != null))
+                        var grpcReady = !otlpEndpoints.Contains("grpc")
+                            || (_dashboard.OtlpEndpoints?.Any(endpoint => endpoint.Protocol.Contains("grpc", StringComparison.OrdinalIgnoreCase)) is true);
+                        var httpReady = !otlpEndpoints.Contains("http")
+                            || (_dashboard.OtlpEndpoints?.Any(endpoint => endpoint.Protocol.Contains("http", StringComparison.OrdinalIgnoreCase)) is true);
+                        var otlpReady = grpcReady && httpReady;
+                        var mcpReady = dashboardOptions.Mcp.Disabled is true || _dashboard.McpEndpoint != null;
+
+                        if (_dashboard.Url != null && otlpReady && mcpReady)
                         {
                             break;
                         }
 
                         frameIndex++;
-                        await Task.Delay(spinner.Interval, sessionToken);
+
+                        try
+                        {
+                            await Task.Delay(spinner.Interval, sessionToken);
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            break;
+                        }
                     }
                 });
 
