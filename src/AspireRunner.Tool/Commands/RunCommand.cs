@@ -6,6 +6,7 @@ using AspireRunner.Tool.ProcessManager;
 using AspireRunner.Tool.ProcessManager.Lpc;
 using Microsoft.Extensions.Logging;
 using Spectre.Console.Rendering;
+using System.Collections.Concurrent;
 using System.ComponentModel;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
@@ -14,6 +15,17 @@ namespace AspireRunner.Tool.Commands;
 
 public class RunCommand : AsyncCommand<RunCommand.Settings>
 {
+    [Flags]
+    private enum UiRefreshArea
+    {
+        None = 0,
+        ProcessPanel = 1,
+        ProcessDetails = 2,
+        ProcessLogs = 4,
+        AspireStatus = 8,
+        Footer = 16
+    }
+
     public class Settings : CommandSettings
     {
         [CommandArgument(0, "[version]")]
@@ -240,6 +252,15 @@ public class RunCommand : AsyncCommand<RunCommand.Settings>
         var serviceStatusState = string.Empty;
         var selectedDetailsState = string.Empty;
         var killRequested = false;
+        var processOperationState = string.Empty;
+        var processOperations = new ConcurrentDictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var processActionGate = new SemaphoreSlim(1, 1);
+        var backgroundActions = new ConcurrentDictionary<int, Task>();
+        var backgroundActionId = 0;
+        var pendingUiRefresh = 0;
+        var processStatusSpinner = !AnsiConsole.Console.Profile.Capabilities.Unicode ? Spinner.Known.Ascii : Spinner.Known.Dots;
+        var processStatusSpinnerFrame = 0;
+        var nextProcessStatusFrameAt = DateTimeOffset.UtcNow;
         const int maxProcessLogLines = 300;
 
         var mainLayout = new Layout("main").SplitRows(
@@ -294,7 +315,18 @@ public class RunCommand : AsyncCommand<RunCommand.Settings>
                             | CheckConsoleSizeChanged()
                             | CheckInventoryChanged()
                             | CheckSelectedProcessLogEntries()
-                            | CheckSelectedProcessDetailsChanged();
+                            | CheckSelectedProcessDetailsChanged()
+                            | CheckProcessOperationStateChanged();
+
+                        ApplyPendingUiRefreshRequests(ref shouldRefresh);
+
+                        if (processOperations.Count > 0 && DateTimeOffset.UtcNow >= nextProcessStatusFrameAt)
+                        {
+                            processStatusSpinnerFrame = (processStatusSpinnerFrame + 1) % processStatusSpinner.Frames.Count;
+                            nextProcessStatusFrameAt = DateTimeOffset.UtcNow.Add(processStatusSpinner.Interval);
+                            UpdateProcessPanel();
+                            shouldRefresh = true;
+                        }
 
                         if (Console.KeyAvailable)
                         {
@@ -321,25 +353,22 @@ public class RunCommand : AsyncCommand<RunCommand.Settings>
                                 }
                                 case ConsoleKey.S:
                                 {
-                                    await StopSelectedProcessAsync();
+                                    QueueStopSelectedProcess();
                                     break;
                                 }
                                 case ConsoleKey.R:
                                 {
-                                    await RestartSelectedProcessAsync();
+                                    QueueRestartSelectedProcess();
                                     break;
                                 }
                                 case ConsoleKey.D:
                                 {
-                                    await DeleteSelectedProcessAsync();
+                                    QueueDeleteSelectedProcess();
                                     break;
                                 }
                                 case ConsoleKey.K:
                                 {
-                                    killRequested = true;
-                                    actionStatus = "Killing runner and all managed processes...";
-                                    UpdateFooterPanel();
-                                    sessionCts.Cancel();
+                                    QueueKillAllAndExit();
                                     break;
                                 }
                                 case ConsoleKey.H or ConsoleKey.Help:
@@ -398,10 +427,11 @@ public class RunCommand : AsyncCommand<RunCommand.Settings>
 
             if (killRequested)
             {
-                await KillAllManagedProcessesAsync();
+                await AwaitBackgroundActionsAsync(TimeSpan.FromSeconds(2)).ConfigureAwait(false);
                 return 0;
             }
 
+            await AwaitBackgroundActionsAsync(TimeSpan.FromSeconds(2)).ConfigureAwait(false);
             await ShutdownManagedProcessesAsync();
             return 0;
         }
@@ -717,7 +747,7 @@ public class RunCommand : AsyncCommand<RunCommand.Settings>
                 .AddColumn("", c => c.Centered().NoWrap().Width(3))
                 .AddColumn("Id", c => c.NoWrap().Width(16))
                 .AddColumn("Process", c => c.NoWrap().Width(24))
-                .AddColumn("Status", c => c.Centered().NoWrap().Width(8))
+                .AddColumn("Status", c => c.Centered().NoWrap().Width(14))
                 .AddColumn("PID", c => c.Centered().NoWrap().Width(8))
                 .AddColumn("Ports", c => c.Centered().NoWrap().Width(18))
                 .AddColumn("Profile", c => c.Centered().NoWrap().Width(12));
@@ -738,7 +768,6 @@ public class RunCommand : AsyncCommand<RunCommand.Settings>
 
             foreach (var entry in entries)
             {
-                var running = entry.Process.IsRunning;
                 var profileText = entry.Profile switch
                 {
                     ProcessProfile.AspireDashboard => "Aspire",
@@ -753,13 +782,25 @@ public class RunCommand : AsyncCommand<RunCommand.Settings>
                     selector.Widget(),
                     entry.Id.Truncate(16).Widget(),
                     entry.Process.DisplayName.Truncate(24).Widget(),
-                    Widgets.TableColumn([Widgets.StatusSymbol(running)], HorizontalAlignment.Center),
+                    BuildProcessStatusCell(entry),
                     (entry.Process.Pid?.ToString() ?? string.Empty).Widget(),
                     BuildPortLinks(entry.ExposedPorts),
                     profileText.Widget());
             }
 
             return inventory;
+        }
+
+        IRenderable BuildProcessStatusCell(ManagedProcessEntry entry)
+        {
+            if (processOperations.TryGetValue(entry.Id, out var operation))
+            {
+                var frame = new Markup(processStatusSpinner.Frames[processStatusSpinnerFrame], Widgets.PrimaryColor);
+                var operationMarkup = new Markup($"[yellow]{Markup.Escape(operation)}[/]");
+                return Widgets.TableColumn([frame, operationMarkup], HorizontalAlignment.Center);
+            }
+
+            return Widgets.TableColumn([Widgets.StatusSymbol(entry.Process.IsRunning)], HorizontalAlignment.Center);
         }
 
         IRenderable BuildPortLinks(IReadOnlyList<int> ports)
@@ -810,6 +851,78 @@ public class RunCommand : AsyncCommand<RunCommand.Settings>
             return true;
         }
 
+        bool CheckProcessOperationStateChanged()
+        {
+            var snapshot = BuildProcessOperationState();
+            if (snapshot == processOperationState)
+            {
+                return false;
+            }
+
+            processOperationState = snapshot;
+            UpdateProcessPanel();
+            UpdateProcessDetailsPanel();
+            return true;
+        }
+
+        string BuildProcessOperationState()
+        {
+            if (processOperations.IsEmpty)
+            {
+                return string.Empty;
+            }
+
+            return string.Join('|', processOperations
+                .OrderBy(item => item.Key, StringComparer.OrdinalIgnoreCase)
+                .Select(item => $"{item.Key}:{item.Value}"));
+        }
+
+        void RequestUiRefresh(UiRefreshArea areas)
+        {
+            Interlocked.Or(ref pendingUiRefresh, (int)areas);
+        }
+
+        void ApplyPendingUiRefreshRequests(ref bool shouldRefresh)
+        {
+            var requested = (UiRefreshArea)Interlocked.Exchange(ref pendingUiRefresh, 0);
+            if (requested == UiRefreshArea.None)
+            {
+                return;
+            }
+
+            if (requested.HasFlag(UiRefreshArea.ProcessPanel))
+            {
+                UpdateProcessPanel();
+                shouldRefresh = true;
+            }
+
+            if (requested.HasFlag(UiRefreshArea.ProcessDetails))
+            {
+                UpdateProcessDetailsPanel();
+                shouldRefresh = true;
+            }
+
+            if (requested.HasFlag(UiRefreshArea.ProcessLogs))
+            {
+                reloadSelectedProcessLogs = true;
+                UpdateProcessLogsPanel(forceReload: true);
+                shouldRefresh = true;
+            }
+
+            if (requested.HasFlag(UiRefreshArea.AspireStatus))
+            {
+                UpdateTableCells(defaultStatus);
+                UpdateAspireStatusPanel();
+                shouldRefresh = true;
+            }
+
+            if (requested.HasFlag(UiRefreshArea.Footer))
+            {
+                UpdateFooterPanel();
+                shouldRefresh = true;
+            }
+        }
+
         string BuildServiceStatusState()
         {
             if (_dashboard is null)
@@ -838,6 +951,8 @@ public class RunCommand : AsyncCommand<RunCommand.Settings>
                 selected.Process.Pid,
                 selected.Profile,
                 selected.Command,
+                selected.Arguments,
+                selected.EnvironmentVariables,
                 selected.Details,
                 selected.WorkingDirectory,
                 string.Join(',', selected.ExposedPorts),
@@ -1071,6 +1186,9 @@ public class RunCommand : AsyncCommand<RunCommand.Settings>
                 fields.AddRow("[grey]Command[/]".Widget(), selected.Command.Truncate(46).Widget());
             }
 
+            fields.AddRow("[grey]Args[/]".Widget(), BuildWrappedDetailsValue(selected.Arguments));
+            fields.AddRow("[grey]Envs[/]".Widget(), BuildWrappedDetailsValue(selected.EnvironmentVariables));
+
             if (!string.IsNullOrWhiteSpace(selected.Details))
             {
                 fields.AddRow("[grey]Details[/]".Widget(), selected.Details.Truncate(46).Widget());
@@ -1082,6 +1200,19 @@ public class RunCommand : AsyncCommand<RunCommand.Settings>
                 .Header($"[{Widgets.PrimaryColorText}]Process Details[/]")
                 .BorderStyle(new Style(Widgets.PrimaryColor, decoration: Decoration.Dim))
                 .Expand();
+
+            static IRenderable BuildWrappedDetailsValue(string? value)
+            {
+                if (string.IsNullOrWhiteSpace(value))
+                {
+                    return new Text("-");
+                }
+
+                return new Text(value)
+                {
+                    Overflow = Overflow.Fold
+                };
+            }
         }
 
         IRenderable BuildFooterPanel()
@@ -1153,112 +1284,200 @@ public class RunCommand : AsyncCommand<RunCommand.Settings>
             UpdateFooterPanel();
         }
 
-        async Task StopSelectedProcessAsync()
+        void QueueStopSelectedProcess()
         {
-            var selected = GetSelectedProcessEntry();
-            if (selected is null)
+            QueueSelectedProcessAction("Stopping", async selected =>
             {
-                actionStatus = "No process selected.";
-                UpdateFooterPanel();
-                return;
-            }
+                var selectedDashboard = selected.Id.Equals(_dashboardProcessId, StringComparison.OrdinalIgnoreCase);
+                var stopped = await _processManager.StopAsync(selected.Id, CancellationToken.None).ConfigureAwait(false);
+                actionStatus = stopped
+                    ? $"Stopped process: {selected.Process.DisplayName}"
+                    : $"Failed to stop process: {selected.Process.DisplayName}";
 
-            var selectedDashboard = selected.Id.Equals(_dashboardProcessId, StringComparison.OrdinalIgnoreCase);
-            var stopped = await _processManager.StopAsync(selected.Id, CancellationToken.None).ConfigureAwait(false);
-            actionStatus = stopped
-                ? $"Stopped process: {selected.Process.DisplayName}"
-                : $"Failed to stop process: {selected.Process.DisplayName}";
+                if (selectedDashboard)
+                {
+                    _dashboardStarted = _dashboard?.IsRunning is true;
+                    serviceStatusState = string.Empty;
+                    RequestUiRefresh(UiRefreshArea.AspireStatus);
+                }
 
-            if (selectedDashboard)
-            {
-                _dashboardStarted = _dashboard?.IsRunning is true;
-                serviceStatusState = string.Empty;
-                UpdateTableCells(defaultStatus);
-                UpdateAspireStatusPanel();
-            }
-
-            SyncDashboardInventory();
-            reloadSelectedProcessLogs = true;
-            UpdateProcessPanel();
-            UpdateProcessDetailsPanel();
-            UpdateProcessLogsPanel(forceReload: true);
-            UpdateFooterPanel();
+                SyncDashboardInventory();
+                RequestUiRefresh(UiRefreshArea.ProcessPanel | UiRefreshArea.ProcessDetails | UiRefreshArea.ProcessLogs | UiRefreshArea.Footer);
+            });
         }
 
-        async Task RestartSelectedProcessAsync()
+        void QueueRestartSelectedProcess()
         {
-            var selected = GetSelectedProcessEntry();
-            if (selected is null)
+            QueueSelectedProcessAction("Restarting", async selected =>
             {
-                actionStatus = "No process selected.";
-                UpdateFooterPanel();
-                return;
-            }
+                var selectedDashboard = selected.Id.Equals(_dashboardProcessId, StringComparison.OrdinalIgnoreCase);
+                if (selectedDashboard)
+                {
+                    _dashboardStarted = false;
+                    serviceStatusState = string.Empty;
+                    RequestUiRefresh(UiRefreshArea.AspireStatus);
+                }
 
-            var selectedDashboard = selected.Id.Equals(_dashboardProcessId, StringComparison.OrdinalIgnoreCase);
-            if (selectedDashboard)
-            {
-                _dashboardStarted = false;
-                ResetTableCells();
-                UpdateAspireStatusPanel();
-            }
+                var restarted = await _processManager.RestartAsync(selected.Id, CancellationToken.None).ConfigureAwait(false);
+                actionStatus = restarted
+                    ? $"Restarted process: {selected.Process.DisplayName}"
+                    : $"Failed to restart process: {selected.Process.DisplayName}";
 
-            var restarted = await _processManager.RestartAsync(selected.Id, CancellationToken.None).ConfigureAwait(false);
-            actionStatus = restarted
-                ? $"Restarted process: {selected.Process.DisplayName}"
-                : $"Failed to restart process: {selected.Process.DisplayName}";
+                if (selectedDashboard)
+                {
+                    _dashboardStarted = _dashboard?.IsRunning is true;
+                    serviceStatusState = string.Empty;
+                    RequestUiRefresh(UiRefreshArea.AspireStatus);
+                }
 
-            if (selectedDashboard)
-            {
-                _dashboardStarted = _dashboard?.IsRunning is true;
-                serviceStatusState = string.Empty;
-                UpdateTableCells(defaultStatus);
-                UpdateAspireStatusPanel();
-            }
-
-            SyncDashboardInventory();
-            reloadSelectedProcessLogs = true;
-            UpdateProcessPanel();
-            UpdateProcessDetailsPanel();
-            UpdateProcessLogsPanel(forceReload: true);
-            UpdateFooterPanel();
+                SyncDashboardInventory();
+                RequestUiRefresh(UiRefreshArea.ProcessPanel | UiRefreshArea.ProcessDetails | UiRefreshArea.ProcessLogs | UiRefreshArea.Footer);
+            });
         }
 
-        async Task DeleteSelectedProcessAsync()
+        void QueueDeleteSelectedProcess()
+        {
+            QueueSelectedProcessAction("Deleting", async selected =>
+            {
+                var removed = await _processManager.RemoveAsync(selected.Id, stopIfRunning: true, CancellationToken.None).ConfigureAwait(false);
+                actionStatus = removed
+                    ? $"Deleted process: {selected.Process.DisplayName}"
+                    : $"Failed to delete process: {selected.Process.DisplayName}";
+
+                if (selected.Id.Equals(_dashboardProcessId, StringComparison.OrdinalIgnoreCase))
+                {
+                    _dashboardProcessId = null;
+                    _dashboardStarted = _dashboard?.IsRunning is true;
+                    serviceStatusState = string.Empty;
+                    RequestUiRefresh(UiRefreshArea.AspireStatus);
+                }
+
+                SyncDashboardInventory();
+                RequestUiRefresh(UiRefreshArea.ProcessPanel | UiRefreshArea.ProcessDetails | UiRefreshArea.ProcessLogs | UiRefreshArea.Footer);
+            });
+        }
+
+        void QueueKillAllAndExit()
+        {
+            if (killRequested)
+            {
+                actionStatus = "Kill request is already running.";
+                RequestUiRefresh(UiRefreshArea.Footer);
+                return;
+            }
+
+            killRequested = true;
+            foreach (var entry in _processManager.List())
+            {
+                processOperations[entry.Id] = "Killing";
+            }
+
+            actionStatus = "Killing runner and all managed processes...";
+            RequestUiRefresh(UiRefreshArea.ProcessPanel | UiRefreshArea.ProcessDetails | UiRefreshArea.Footer);
+
+            var task = Task.Run(async () =>
+            {
+                await processActionGate.WaitAsync().ConfigureAwait(false);
+                try
+                {
+                    await KillAllManagedProcessesAsync().ConfigureAwait(false);
+                    actionStatus = "Killed all managed processes. Exiting...";
+                }
+                catch (Exception ex)
+                {
+                    actionStatus = $"Failed to kill all processes: {ex.Message}";
+                }
+                finally
+                {
+                    processOperations.Clear();
+                    serviceStatusState = string.Empty;
+                    processActionGate.Release();
+                    RequestUiRefresh(UiRefreshArea.ProcessPanel | UiRefreshArea.ProcessDetails | UiRefreshArea.ProcessLogs | UiRefreshArea.AspireStatus | UiRefreshArea.Footer);
+                    sessionCts.Cancel();
+                }
+            });
+
+            TrackBackgroundAction(task);
+        }
+
+        void QueueSelectedProcessAction(string operationLabel, Func<ManagedProcessEntry, Task> action)
         {
             var selected = GetSelectedProcessEntry();
             if (selected is null)
             {
                 actionStatus = "No process selected.";
-                UpdateFooterPanel();
+                RequestUiRefresh(UiRefreshArea.Footer);
                 return;
             }
 
-            var removed = await _processManager.RemoveAsync(selected.Id, stopIfRunning: true, CancellationToken.None).ConfigureAwait(false);
-            actionStatus = removed
-                ? $"Deleted process: {selected.Process.DisplayName}"
-                : $"Failed to delete process: {selected.Process.DisplayName}";
-
-            if (selected.Id.Equals(_dashboardProcessId, StringComparison.OrdinalIgnoreCase))
+            if (!processOperations.TryAdd(selected.Id, operationLabel))
             {
-                _dashboardProcessId = null;
-                _dashboardStarted = _dashboard?.IsRunning is true;
-                serviceStatusState = string.Empty;
-                UpdateTableCells(defaultStatus);
-                UpdateAspireStatusPanel();
+                var currentState = processOperations.TryGetValue(selected.Id, out var existing) ? existing : "processing";
+                actionStatus = $"Process '{selected.Process.DisplayName}' is already {currentState.ToLowerInvariant()}.";
+                RequestUiRefresh(UiRefreshArea.Footer);
+                return;
             }
 
-            selectedProcessId = string.Empty;
-            processLogsProcessId = string.Empty;
-            processLogEntries.Clear();
+            actionStatus = $"{operationLabel} process: {selected.Process.DisplayName}...";
+            RequestUiRefresh(UiRefreshArea.ProcessPanel | UiRefreshArea.ProcessDetails | UiRefreshArea.Footer);
 
-            SyncDashboardInventory();
-            EnsureSelectedProcess();
-            reloadSelectedProcessLogs = true;
-            UpdateProcessPanel();
-            UpdateProcessDetailsPanel();
-            UpdateProcessLogsPanel(forceReload: true);
-            UpdateFooterPanel();
+            var task = Task.Run(async () =>
+            {
+                await processActionGate.WaitAsync().ConfigureAwait(false);
+                try
+                {
+                    await action(selected).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    actionStatus = $"{operationLabel} failed for {selected.Process.DisplayName}: {ex.Message}";
+                    RequestUiRefresh(UiRefreshArea.Footer);
+                }
+                finally
+                {
+                    processOperations.TryRemove(selected.Id, out _);
+                    processActionGate.Release();
+                    RequestUiRefresh(UiRefreshArea.ProcessPanel | UiRefreshArea.ProcessDetails | UiRefreshArea.Footer);
+                }
+            });
+
+            TrackBackgroundAction(task);
+        }
+
+        void TrackBackgroundAction(Task actionTask)
+        {
+            var id = Interlocked.Increment(ref backgroundActionId);
+            backgroundActions[id] = actionTask;
+
+            _ = actionTask.ContinueWith(_ =>
+            {
+                backgroundActions.TryRemove(new KeyValuePair<int, Task>(id, actionTask));
+            }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+        }
+
+        async Task AwaitBackgroundActionsAsync(TimeSpan timeout)
+        {
+            var tasks = backgroundActions.Values.ToArray();
+            if (tasks.Length == 0)
+            {
+                return;
+            }
+
+            var allActions = Task.WhenAll(tasks);
+            var completed = await Task.WhenAny(allActions, Task.Delay(timeout)).ConfigureAwait(false);
+            if (completed != allActions)
+            {
+                return;
+            }
+
+            try
+            {
+                await allActions.ConfigureAwait(false);
+            }
+            catch
+            {
+                // Ignore operation failures during shutdown.
+            }
         }
 
         string BuildInventoryState()

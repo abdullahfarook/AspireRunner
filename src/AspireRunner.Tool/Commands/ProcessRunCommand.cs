@@ -34,8 +34,12 @@ public class ProcessRunCommand : AsyncCommand<ProcessRunCommand.Settings>
         public string? WorkingDirectory { get; set; }
 
         [CommandOption("--env")]
-        [Description("Environment variable in KEY=VALUE format. Pass multiple times to add more entries")]
+        [Description("Environment variable in KEY=VALUE format. Accepts semicolon-separated entries and can be passed multiple times")]
         public string[] EnvironmentEntries { get; set; } = [];
+
+        [CommandOption("--envs")]
+        [Description("Environment variables in KEY=VALUE;KEY2=VALUE2 format")]
+        public string? EnvironmentVariables { get; set; }
 
         [CommandOption("--port")]
         [Description("Exposed port for the process. Pass multiple times for multiple ports")]
@@ -67,10 +71,10 @@ public class ProcessRunCommand : AsyncCommand<ProcessRunCommand.Settings>
         Widgets.Write([Widgets.Header(), Widgets.RunnerVersion]);
         Widgets.WriteLines(2);
 
-        var parseResult = ParseEnvironmentVariables(settings.EnvironmentEntries);
+        var parseResult = ParseEnvironmentVariables(settings.EnvironmentEntries, settings.EnvironmentVariables);
         if (parseResult.InvalidEntries.Length > 0)
         {
-            Widgets.Write(Widgets.Error($"Invalid --env entries: {string.Join(", ", parseResult.InvalidEntries)}"));
+            Widgets.Write(Widgets.Error($"Invalid environment entries (expected KEY=VALUE): {string.Join(", ", parseResult.InvalidEntries)}"));
             return 2;
         }
 
@@ -300,18 +304,35 @@ public class ProcessRunCommand : AsyncCommand<ProcessRunCommand.Settings>
         return [..tokens];
     }
 
-    private static (IReadOnlyDictionary<string, string?> EnvironmentVariables, string[] InvalidEntries) ParseEnvironmentVariables(IEnumerable<string> entries)
+    private static (IReadOnlyDictionary<string, string?> EnvironmentVariables, string[] InvalidEntries) ParseEnvironmentVariables(
+        IEnumerable<string> entries,
+        string? semicolonEntries)
     {
         var variables = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
         var invalidEntries = new List<string>();
 
+        ParseEnvironmentSource(semicolonEntries, variables, invalidEntries);
+
         foreach (var entry in entries)
         {
-            if (string.IsNullOrWhiteSpace(entry))
-            {
-                continue;
-            }
+            ParseEnvironmentSource(entry, variables, invalidEntries);
+        }
 
+        return (variables, [..invalidEntries]);
+    }
+
+    private static void ParseEnvironmentSource(
+        string? raw,
+        IDictionary<string, string?> variables,
+        ICollection<string> invalidEntries)
+    {
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            return;
+        }
+
+        foreach (var entry in raw.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
             var separatorIndex = entry.IndexOf('=');
             if (separatorIndex <= 0)
             {
@@ -329,7 +350,5 @@ public class ProcessRunCommand : AsyncCommand<ProcessRunCommand.Settings>
 
             variables[key] = value;
         }
-
-        return (variables, [..invalidEntries]);
     }
 }

@@ -310,7 +310,9 @@ function Ensure-RegisteredProcess {
         [string]$ArgumentText,
         [int]$ExpectedPort,
         [string]$WorkingDir,
-        [string]$EnvironmentText = ""
+        [string]$EnvironmentText = "",
+        [ValidateSet("envs", "env", "environmentVariables", "environment")]
+        [string]$EnvironmentField = "envs"
     )
 
     $existing = Get-LpcProcessByName -Name $Name
@@ -326,15 +328,20 @@ function Ensure-RegisteredProcess {
     }
 
     Write-Step "Registering managed process: $Name"
-    $registerResponse = Invoke-LpcRequest -Request @{
+    $registerRequest = @{
         command = "Register"
         name = $Name
         exe = $Exe
         args = $ArgumentText
         port = $ExpectedPort
-        envs = $EnvironmentText
         workingDir = $WorkingDir
     }
+
+    if (-not [string]::IsNullOrWhiteSpace($EnvironmentText)) {
+        $registerRequest[$EnvironmentField] = $EnvironmentText
+    }
+
+    $registerResponse = Invoke-LpcRequest -Request $registerRequest
 
     Assert-True -Condition $registerResponse.ok -Message "Register command succeeded for $Name"
     Assert-True -Condition (Wait-PortState -Port $ExpectedPort -ShouldBeListening $true -TimeoutSeconds 40) -Message "$Name is listening on port $ExpectedPort"
@@ -410,8 +417,8 @@ $nodeArgs = ('"' + $nodeScriptPath + '"')
 $csharpArgs = ('run --project "' + $csharpProjectPath + '"')
 $keepArgs = $nodeArgs
 
-$nodePid = Ensure-RegisteredProcess -Name "NodeExpressTestApp" -Exe "node" -ArgumentText $nodeArgs -ExpectedPort $NodePort -WorkingDir $testsDir -EnvironmentText ("PORT={0}" -f $NodePort)
-$csharpPid = Ensure-RegisteredProcess -Name "CSharpSingleFileTestApp" -Exe "dotnet" -ArgumentText $csharpArgs -ExpectedPort $CSharpPort -WorkingDir $repoRoot -EnvironmentText ("PORT={0}" -f $CSharpPort)
+$nodePid = Ensure-RegisteredProcess -Name "NodeExpressTestApp" -Exe "node" -ArgumentText $nodeArgs -ExpectedPort $NodePort -WorkingDir $testsDir -EnvironmentText ("ASPNETCORE_ENVIRONMENT=Development;PORT={0};FEATURE_FLAG=true" -f $NodePort) -EnvironmentField "environmentVariables"
+$csharpPid = Ensure-RegisteredProcess -Name "CSharpSingleFileTestApp" -Exe "dotnet" -ArgumentText $csharpArgs -ExpectedPort $CSharpPort -WorkingDir $repoRoot -EnvironmentText ("DOTNET_ENVIRONMENT=Development;PORT={0}" -f $CSharpPort) -EnvironmentField "env"
 
 Assert-True -Condition (Wait-PortState -Port $NodePort -ShouldBeListening $true -TimeoutSeconds 10) -Message "Node app port $NodePort is open"
 Assert-True -Condition (Wait-PortState -Port $CSharpPort -ShouldBeListening $true -TimeoutSeconds 10) -Message "C# app port $CSharpPort is open"

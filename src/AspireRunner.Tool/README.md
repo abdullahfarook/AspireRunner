@@ -135,12 +135,20 @@ OPTIONS:
         --name                            Display name for the managed process
     --id                              Process id in the session inventory
         --working-dir                     Working directory for the process
-        --env                             Environment variable in KEY=VALUE format. Pass multiple times to add more entries
+        --env                             Environment variable in KEY=VALUE format. Accepts semicolon-separated entries and can be passed multiple times
+        --envs                            Environment variables in KEY=VALUE;KEY2=VALUE2 format
         --detach                          Start the process and return immediately
         --restart-on-failure              Automatically restart the process when it exits unexpectedly
         --restart-delay        2          Delay in seconds before restarting after an unexpected exit
         --pipe-output          True       Write process output directly to the terminal
 ```
+
+    Examples:
+
+    ```bash
+    aspire-dashboard process run node --args="app.js" --env PORT=39000 --env ASPNETCORE_URLS=http://localhost:39000
+    aspire-dashboard process run dotnet --args="run --project ./Api/Api.csproj" --envs "ASPNETCORE_URLS=http://localhost:5005;PORT=5005"
+    ```
 
 ### Process list command
 
@@ -222,6 +230,12 @@ Compatible request commands:
 - `Shutdown`
 - `Stdout` / `StdoutLiveOnly`
 - `Stderr` / `StderrLiveOnly`
+
+`Register` accepts environment variables in semicolon format (`KEY=VALUE;KEY2=VALUE2`) using any of these fields:
+- `envs`
+- `env`
+- `environmentVariables`
+- `environment`
 
 `Shutdown` stops all managed processes tracked by the active runner host and then exits the host process.
 

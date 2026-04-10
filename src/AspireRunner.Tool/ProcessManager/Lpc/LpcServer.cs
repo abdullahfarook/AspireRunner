@@ -288,9 +288,10 @@ internal sealed class LpcServer : IDisposable
             return;
         }
 
-        var environmentVariables = ParseEnvironmentVariables(request.Envs);
+        var environmentText = ResolveEnvironmentVariables(request);
+        var environmentVariables = ParseEnvironmentVariables(environmentText);
         var parsedArguments = ParseArguments(request.Args);
-        var inferredPorts = InferPorts(parsedArguments, request.Envs, request.Port);
+        var inferredPorts = InferPorts(parsedArguments, environmentText, request.Port);
         var processOptions = new ExecutableProcessOptions
         {
             ExecutablePath = request.Exe,
@@ -330,7 +331,7 @@ internal sealed class LpcServer : IDisposable
             details: BuildDetails(processOptions, managedProcess, inferredPorts),
             executable: request.Exe,
             arguments: argsText,
-            environmentVariables: request.Envs,
+            environmentVariables: environmentText,
             workingDirectory: request.WorkingDir,
             exposedPorts: inferredPorts);
 
@@ -483,6 +484,26 @@ internal sealed class LpcServer : IDisposable
         }
 
         return variables;
+    }
+
+    private static string? ResolveEnvironmentVariables(LpcRequest request)
+    {
+        if (!string.IsNullOrWhiteSpace(request.Envs))
+        {
+            return request.Envs;
+        }
+
+        if (!string.IsNullOrWhiteSpace(request.Env))
+        {
+            return request.Env;
+        }
+
+        if (!string.IsNullOrWhiteSpace(request.EnvironmentVariables))
+        {
+            return request.EnvironmentVariables;
+        }
+
+        return string.IsNullOrWhiteSpace(request.Environment) ? null : request.Environment;
     }
 
     private static string[] ParseArguments(string? rawArguments)
