@@ -515,8 +515,8 @@ public class ProcessListCommand : AsyncCommand<ProcessListCommand.Settings>
         try
         {
             using var client = new TcpClient();
-            client.ReceiveTimeout = 5000;
-            client.SendTimeout = 5000;
+            client.ReceiveTimeout = 30000;
+            client.SendTimeout = 10000;
             client.Connect(IPAddress.Loopback, port);
 
             using var stream = client.GetStream();

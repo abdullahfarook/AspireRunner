@@ -76,12 +76,14 @@ OPTIONS:
 
     While the dashboard runner is active, you can use the following keys in the interactive UI:
 
-    - `S`: Stop the dashboard
-    - `R`: Restart the dashboard
-    - `P`: Open the interactive process list and actions view (stop, restart, delete, logs)
+    - `↑/↓`: Select managed process in the process list
+    - `L`: Reload selected-process logs (history + live updates)
+    - `S`: Stop selected managed process
+    - `R`: Restart selected managed process
+    - `D`: Delete selected managed process
     - `B`: Open the dashboard in the default browser
     - `H`: Open project documentation/help
-    - `Esc`: Exit the runner
+    - `Esc` or `Ctrl+C`: Exit the runner
 
 ### Install command
 
@@ -192,7 +194,15 @@ aspire-dashboard process remove <id> [--keep-running]
 
 ### Run UI process inventory
 
-The `aspire-dashboard aspire run` terminal UI now includes a process inventory table fed by the in-memory manager. This is the first step toward replacing fixed Aspire-only status rows with profile-based managed process inventory rows.
+The `aspire-dashboard aspire run` terminal UI includes integrated, bounded panels for:
+
+- Managed process inventory (with keyboard selection)
+- Selected-process logs (history + live stream)
+- Aspire service status
+- Aspire logs
+- Inline controls/status footer
+
+You can manage processes directly from the main dashboard without opening a separate process view.
 
 ### ProcessManager.Client compatibility (LPC)
 

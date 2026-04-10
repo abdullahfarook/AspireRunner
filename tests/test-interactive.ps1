@@ -221,8 +221,8 @@ function Assert-OutputContains {
         [string]$Message
     )
 
-    $matches = @($Output | Where-Object { $_ -match $Regex })
-    Assert-True -Condition ($matches.Count -gt 0) -Message $Message
+    $matchingLines = @($Output | Where-Object { $_ -match $Regex })
+    Assert-True -Condition ($matchingLines.Count -gt 0) -Message $Message
 }
 
 function Invoke-ToolProcessAction {
@@ -491,8 +491,8 @@ if ($Auto) {
 else {
     Show-ManualSteps -Title "Interactive exit (detach back to dashboard view)" -Steps @(
         "Focus the Aspire host terminal window.",
-        "Press P to open the process actions view.",
-        "Exit the process actions view and return to the main dashboard view."
+        "Use Up/Down arrows to move selection in the process list.",
+        "Verify the selected process logs are shown in the logs panel below."
     )
 }
 
@@ -507,10 +507,9 @@ if ($Auto) {
 }
 else {
     Show-ManualSteps -Title "Interactive viewLogs on selected process" -Steps @(
-        "Press P to open process actions.",
-        "Select NodeExpressTestApp.",
-        "Choose Logs and verify both stdout and stderr lines appear.",
-        "Exit logs and return to the main dashboard view."
+        "Use Up/Down to select NodeExpressTestApp.",
+        "Press L to reload history for the selected process.",
+        "Verify both stdout and stderr lines appear in the process logs panel."
     )
 
     Assert-True -Condition (Ask-YesNo -Prompt "Did logs show both stdout and stderr lines") -Message "Interactive logs check confirmed"
@@ -523,9 +522,8 @@ if ($Auto) {
 }
 else {
     Show-ManualSteps -Title "Interactive selected-process stop (Node)" -Steps @(
-        "Press P.",
-        "Select NodeExpressTestApp.",
-        "Choose Stop."
+        "Use Up/Down to select NodeExpressTestApp.",
+        "Press S to stop the selected process."
     )
 }
 
@@ -540,9 +538,8 @@ if ($Auto) {
 }
 else {
     Show-ManualSteps -Title "Interactive selected-process restart (Node)" -Steps @(
-        "Press P.",
-        "Select NodeExpressTestApp.",
-        "Choose Restart."
+        "Use Up/Down to select NodeExpressTestApp.",
+        "Press R to restart the selected process."
     )
 }
 
@@ -557,9 +554,8 @@ if ($Auto) {
 }
 else {
     Show-ManualSteps -Title "Interactive selected-process stop (CSharp)" -Steps @(
-        "Press P.",
-        "Select CSharpSingleFileTestApp.",
-        "Choose Stop."
+        "Use Up/Down to select CSharpSingleFileTestApp.",
+        "Press S to stop the selected process."
     )
 }
 
@@ -572,9 +568,8 @@ if ($Auto) {
 }
 else {
     Show-ManualSteps -Title "Interactive selected-process restart (CSharp)" -Steps @(
-        "Press P.",
-        "Select CSharpSingleFileTestApp.",
-        "Choose Restart."
+        "Use Up/Down to select CSharpSingleFileTestApp.",
+        "Press R to restart the selected process."
     )
 }
 
@@ -587,9 +582,8 @@ if ($Auto) {
 }
 else {
     Show-ManualSteps -Title "Interactive selected-process delete (CSharp)" -Steps @(
-        "Press P.",
-        "Select CSharpSingleFileTestApp.",
-        "Choose Delete."
+        "Use Up/Down to select CSharpSingleFileTestApp.",
+        "Press D to delete the selected process."
     )
 }
 
